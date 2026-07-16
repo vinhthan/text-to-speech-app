@@ -1,8 +1,9 @@
 package com.texttospeech.app
 
 import android.content.Context
-import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import java.util.Locale
@@ -11,13 +12,12 @@ import java.util.Locale
  * Wraps Android TextToSpeech with:
  *  - Listener-based callbacks (multiple observers supported)
  *  - Sentence-level chunking — each sentence is its own TTS utterance
- *    → better prosody / intonation per sentence, natural inter-sentence pauses
- *  - Explicit sequential triggering in onDone — no reliance on QUEUE_ADD
- *    which can be silently dropped on some Android versions / engine combinations
- *  - Best-voice auto-selection — picks the highest-quality installed voice
- *    for each locale (prefers neural / enhanced voices when available)
- *  - Auto-language mode — [LanguageDetector] labels each word-group with the
- *    correct locale (VI / EN) so the TTS engine switches voice mid-document
+ *  - Explicit sequential triggering via mainHandler.post() in onDone —
+ *    avoids calling speak() from inside a TTS binder callback thread,
+ *    which is silently ignored on some OEM / Android-version combinations
+ *  - speak() return-value check + error signal on failure
+ *  - Best-voice auto-selection per locale (neural / enhanced preferred)
+ *  - Auto-language mode — LanguageDetector labels each word-group VI / EN
  */
 class TtsManager(private val context: Context) {
 
@@ -52,12 +52,7 @@ class TtsManager(private val context: Context) {
     // ─── Voice metadata ───────────────────────────────────────────────────────
 
     enum class VoiceStatus {
-        /** Downloaded and works offline. */
-        LOCAL,
-        /** Works immediately but requires an internet connection. */
-        NETWORK,
-        /** Known to the engine but not yet downloaded — user must install it. */
-        NOT_INSTALLED
+        LOCAL, NETWORK, NOT_INSTALLED
     }
 
     data class VoiceItem(
@@ -73,9 +68,20 @@ class TtsManager(private val context: Context) {
 
     private var tts: TextToSpeech? = null
 
+    /**
+     * Handler on the main looper — used to post speakChunk() calls OUT of
+     * the TTS binder callback thread (onDone/onError). Calling speak() from
+     * inside a TTS progress callback is technically undefined behaviour and
+     * silently fails on several OEM ROMs when the app is in the background.
+     */
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     @Volatile var isInitialized = false; private set
     @Volatile var isPlaying     = false; private set
     @Volatile var isPaused      = false; private set
+
+    /** Raw text saved so TtsService can persist it across process restarts. */
+    private var rawText = ""
 
     private var chunks                      = emptyList<Chunk>()
     @Volatile private var currentChunkIndex = 0
@@ -84,13 +90,7 @@ class TtsManager(private val context: Context) {
     private var currentLocale          = Locale("vi", "VN")
     @Volatile private var autoLanguage = false
 
-    /**
-     * The locale actually loaded in the TTS engine right now.
-     * Null = unknown / stale → must re-apply before the next speak() call.
-     */
     private var activeSpeakingLocale: Locale? = null
-
-    /** Cache of best voice per language code to avoid repeated voice queries. */
     private val bestVoiceCache = mutableMapOf<String, android.speech.tts.Voice?>()
 
     // ─── Initialisation ──────────────────────────────────────────────────────
@@ -122,16 +122,21 @@ class TtsManager(private val context: Context) {
             }
 
             override fun onDone(utteranceId: String?) {
+                // Post to main thread — avoids calling speak() from within
+                // the TTS binder callback, which fails silently on many devices.
                 if (isPaused) return
                 val idx = parseIdx(utteranceId) ?: return
-                if (idx >= chunks.size - 1) {
-                    isPlaying = false
-                    currentChunkIndex = 0
-                    eachListener { onFinished() }
-                } else {
-                    val next = idx + 1
-                    currentChunkIndex = next
-                    speakChunk(next)
+                mainHandler.post {
+                    if (isPaused || !isPlaying) return@post
+                    if (idx >= chunks.size - 1) {
+                        isPlaying = false
+                        currentChunkIndex = 0
+                        eachListener { onFinished() }
+                    } else {
+                        val next = idx + 1
+                        currentChunkIndex = next
+                        speakChunk(next)
+                    }
                 }
             }
 
@@ -149,11 +154,13 @@ class TtsManager(private val context: Context) {
     // ─── Text management ─────────────────────────────────────────────────────
 
     fun setText(text: String) {
+        rawText = text
         stop()
         chunks = buildChunks(text)
         currentChunkIndex = 0
     }
 
+    fun getRawText()            = rawText
     fun getCurrentLocale()      = currentLocale
     fun getSpeechRate()         = speechRate
     fun getTotalChunks()        = chunks.size
@@ -166,7 +173,7 @@ class TtsManager(private val context: Context) {
         if (chunks.isEmpty()) { eachListener { onError("Chưa có nội dung để đọc.") }; return }
         isPlaying = true
         isPaused  = false
-        activeSpeakingLocale = null   // force locale application on first chunk
+        activeSpeakingLocale = null
         eachListener { onPlaybackStarted() }
         speakChunk(currentChunkIndex)
     }
@@ -182,12 +189,13 @@ class TtsManager(private val context: Context) {
         if (!isPaused) return
         isPaused  = false
         isPlaying = true
-        activeSpeakingLocale = null   // force locale re-application after pause
+        activeSpeakingLocale = null
         eachListener { onPlaybackStarted() }
         speakChunk(currentChunkIndex)
     }
 
     fun stop() {
+        mainHandler.removeCallbacksAndMessages(null)   // cancel any pending speakChunk posts
         tts?.stop()
         isPlaying         = false
         isPaused          = false
@@ -196,12 +204,13 @@ class TtsManager(private val context: Context) {
 
     fun seekToChunk(index: Int) {
         val wasPlaying = isPlaying
+        mainHandler.removeCallbacksAndMessages(null)
         tts?.stop()
         currentChunkIndex = index.coerceIn(0, (chunks.size - 1).coerceAtLeast(0))
         if (wasPlaying) {
             isPlaying = true
             isPaused  = false
-            activeSpeakingLocale = null   // force locale re-application after seek
+            activeSpeakingLocale = null
             speakChunk(currentChunkIndex)
         }
     }
@@ -215,20 +224,11 @@ class TtsManager(private val context: Context) {
 
     fun setLanguage(locale: Locale) {
         currentLocale = locale
-        if (isInitialized) {
-            activeSpeakingLocale = applyLocale(locale)
-        }
+        if (isInitialized) activeSpeakingLocale = applyLocale(locale)
     }
 
-    fun setAutoLanguage(enabled: Boolean) {
-        autoLanguage = enabled
-    }
+    fun setAutoLanguage(enabled: Boolean) { autoLanguage = enabled }
 
-    /**
-     * Returns **all** voices for [locale] — local offline, network (online), and
-     * not-yet-downloaded — so the UI can present the full picture to the user.
-     * Sorted by: installed first, then by quality descending.
-     */
     fun getVoicesForLocale(locale: Locale): List<VoiceItem> {
         val notInstalledKey = TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED
         return tts?.voices
@@ -242,27 +242,38 @@ class TtsManager(private val context: Context) {
                 VoiceItem(v, status)
             }
             ?.sortedWith(
-                compareBy<VoiceItem> { it.status.ordinal }       // LOCAL < NETWORK < NOT_INSTALLED
+                compareBy<VoiceItem> { it.status.ordinal }
                     .thenByDescending { it.voice.quality }
             )
             ?: emptyList()
     }
 
-    /** The voice currently active in the engine, or null if not yet initialized. */
     fun getCurrentVoice(): android.speech.tts.Voice? = tts?.voice
 
-    /** Applies [voice] immediately and updates the best-voice cache for its language. */
     fun setVoice(voice: android.speech.tts.Voice) {
         tts?.voice = voice
         bestVoiceCache[voice.locale.language] = voice
-        activeSpeakingLocale = null   // force locale/voice re-apply on next speak
+        activeSpeakingLocale = null
     }
 
-    /**
-     * Applies [locale] to the TTS engine and selects the best available voice.
-     * @return the locale that was actually applied (may fall back to English if
-     *         the requested locale is not installed).
-     */
+    // ─── Internal helpers ────────────────────────────────────────────────────
+
+    private fun speakChunk(index: Int) {
+        if (index < 0 || index >= chunks.size || !isInitialized) return
+        val chunk = chunks[index]
+        if (chunk.locale != activeSpeakingLocale) {
+            activeSpeakingLocale = applyLocale(chunk.locale)
+        }
+        val result = tts?.speak(chunk.text, TextToSpeech.QUEUE_FLUSH, Bundle(), "chunk_$index")
+        if (result == TextToSpeech.ERROR) {
+            // Engine rejected speak() — signal error so service can handle recovery
+            isPlaying = false
+            eachListener { onError("TTS engine lỗi — nhấn Phát để thử lại") }
+        }
+    }
+
+    private fun parseIdx(id: String?) = id?.removePrefix("chunk_")?.toIntOrNull()
+
     private fun applyLocale(locale: Locale): Locale {
         val result = tts?.setLanguage(locale)
         return if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
@@ -276,15 +287,9 @@ class TtsManager(private val context: Context) {
         }
     }
 
-    /**
-     * Selects the highest-quality installed voice for [locale].
-     * Results are cached per language code to avoid redundant queries.
-     * Requires API 21+ (minSdk 24 ✓).
-     */
     private fun selectBestVoice(locale: Locale) {
         val engine = tts ?: return
         val key    = locale.language
-
         val voice = bestVoiceCache.getOrPut(key) {
             engine.voices
                 ?.filter { v ->
@@ -297,32 +302,8 @@ class TtsManager(private val context: Context) {
         voice?.let { engine.voice = it }
     }
 
-    // ─── Internal helpers ────────────────────────────────────────────────────
-
-    private fun speakChunk(index: Int) {
-        if (index < 0 || index >= chunks.size || !isInitialized) return
-        val chunk = chunks[index]
-        if (chunk.locale != activeSpeakingLocale) {
-            activeSpeakingLocale = applyLocale(chunk.locale)
-        }
-        tts?.speak(chunk.text, TextToSpeech.QUEUE_FLUSH, Bundle(), "chunk_$index")
-    }
-
-    private fun parseIdx(id: String?) = id?.removePrefix("chunk_")?.toIntOrNull()
-
     // ─── Chunking ────────────────────────────────────────────────────────────
 
-    /**
-     * Builds the ordered list of chunks to speak.
-     *
-     * **Auto-language mode** ([autoLanguage] = true):
-     *   [LanguageDetector] splits the text into locale-labelled segments first;
-     *   each segment is then sentence-split independently, enabling the TTS
-     *   engine to switch voice at natural word-group boundaries.
-     *
-     * **Single-language mode** ([autoLanguage] = false):
-     *   The full text is sentence-split using [currentLocale] only.
-     */
     private fun buildChunks(text: String): List<Chunk> {
         return if (autoLanguage) {
             LanguageDetector.segmentText(text, currentLocale)
@@ -373,12 +354,13 @@ class TtsManager(private val context: Context) {
     // ─── Lifecycle ───────────────────────────────────────────────────────────
 
     fun release() {
+        mainHandler.removeCallbacksAndMessages(null)
         tts?.stop()
         tts?.shutdown()
-        tts                  = null
-        isInitialized        = false
-        isPlaying            = false
-        isPaused             = false
+        tts           = null
+        isInitialized = false
+        isPlaying     = false
+        isPaused      = false
         bestVoiceCache.clear()
     }
 }

@@ -464,6 +464,14 @@ class MainActivity : AppCompatActivity() {
             if (raw.isBlank()) { toast("Vui lòng nhập nội dung"); return@setOnClickListener }
             val mgr = tts ?: return@setOnClickListener
 
+            // Remind user to grant battery optimisation exemption every time
+            // they start playback while it's still not granted — it's the most
+            // critical permission for uninterrupted background TTS.
+            val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                toast("⚠️ Chưa tắt tối ưu pin — TTS có thể bị dừng khi thoát app")
+            }
+
             when {
                 mgr.isPaused -> {
                     mgr.resume()

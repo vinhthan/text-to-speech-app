@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
@@ -18,19 +19,19 @@ import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
 import androidx.core.app.NotificationCompat
 import androidx.media.app.NotificationCompat as MediaNotificationCompat
+import java.io.File
 
 /**
  * Foreground Service that owns the TtsManager so playback continues
- * even when the Activity is in the background or the screen is off.
+ * when the Activity is in the background or the screen is off.
  *
- * Reliability stack (all three layers are needed):
- *  1. PARTIAL_WAKE_LOCK        — keeps CPU awake while screen is off
- *  2. AudioFocus AUDIOFOCUS_GAIN — tells Android this app owns audio;
- *                                  prevents the system from silently
- *                                  dropping subsequent speak() calls
- *  3. Active MediaSessionCompat — signals "this is media playback",
- *                                  exempted from aggressive OEM battery
- *                                  managers the same way music apps are
+ * Reliability stack:
+ *  1. PARTIAL_WAKE_LOCK          — keeps CPU awake while screen is off
+ *  2. AudioFocus AUDIOFOCUS_GAIN — Android will not mute/drop speak() calls
+ *     ↳ auto-resumes after transient focus loss (notification sounds etc.)
+ *  3. Active MediaSessionCompat  — OEM battery managers treat us like Spotify
+ *  4. Text/chunk persistence     — if the process is killed (OEM aggression)
+ *     and restarted via START_STICKY, playback resumes from the saved position
  */
 class TtsService : Service() {
 
@@ -59,6 +60,10 @@ class TtsService : Service() {
         const val ACTION_STOP         = "com.texttospeech.app.STOP"
         const val CHANNEL_ID          = "tts_playback"
         const val NOTIF_ID            = 1001
+        private const val PREFS_NAME  = "tts_state"
+        private const val KEY_CHUNK   = "chunk"
+        private const val KEY_PLAYING = "playing"
+        private const val TEXT_FILE   = "tts_last_text.txt"
     }
 
     // ─── State ───────────────────────────────────────────────────────────────
@@ -72,22 +77,56 @@ class TtsService : Service() {
     // Wake lock
     private var wakeLock: PowerManager.WakeLock? = null
 
-    // Audio focus
+    // Audio focus ─────────────────────────────────────────────────────────────
     private var audioFocusRequest: AudioFocusRequest? = null   // API 26+
-    private var hasAudioFocus = false
+    private var hasAudioFocus    = false
+    /**
+     * True when WE called ttsManager.pause() because of a transient focus loss
+     * (e.g. notification sound). On AUDIOFOCUS_GAIN we must auto-resume so
+     * playback is never silently stuck in the paused state.
+     */
+    private var pausedByFocusLoss = false
+
     private val onAudioFocusChange = AudioManager.OnAudioFocusChangeListener { focus ->
         when (focus) {
-            AudioManager.AUDIOFOCUS_LOSS,
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                if (ttsManager.isPlaying) ttsManager.pause()
+            AudioManager.AUDIOFOCUS_LOSS -> {
+                // Permanent loss — pause but do NOT auto-resume later
+                if (ttsManager.isPlaying) {
+                    ttsManager.pause()
+                    updateNotification("Tạm dừng", isPlaying = false)
+                }
+                hasAudioFocus = false
+                pausedByFocusLoss = false   // permanent loss, not transient
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                // Transient loss (notification, phone call start, etc.)
+                // Pause and mark so we auto-resume when focus returns
+                if (ttsManager.isPlaying) {
+                    ttsManager.pause()
+                    updateNotification("Tạm dừng", isPlaying = false)
+                    pausedByFocusLoss = true
+                }
                 hasAudioFocus = false
             }
-            AudioManager.AUDIOFOCUS_GAIN -> hasAudioFocus = true
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                hasAudioFocus = true
+                // Auto-resume ONLY if we paused because of a transient loss
+                if (pausedByFocusLoss && ttsManager.isPaused) {
+                    pausedByFocusLoss = false
+                    ttsManager.resume()   // onPlaybackStarted fires → re-requests focus
+                    updateSessionState(PlaybackStateCompat.STATE_PLAYING)
+                }
+            }
         }
     }
 
-    // MediaSession — active session signals "media playback" to the OS
+    // MediaSession
     private lateinit var mediaSession: MediaSessionCompat
+
+    // Restore-on-restart flags (set when START_STICKY restarts with null intent)
+    private var restoreChunk = 0
+    private var needsRestore = false
 
     // ─── Lifecycle ───────────────────────────────────────────────────────────
 
@@ -116,21 +155,35 @@ class TtsService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
+        if (intent == null) {
+            // Service was killed and restarted by START_STICKY — attempt to restore
+            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            if (prefs.getBoolean(KEY_PLAYING, false)) {
+                restoreChunk = prefs.getInt(KEY_CHUNK, 0)
+                needsRestore = true
+                // Actual restore happens in serviceListener.onInitialized()
+                // once the TTS engine is ready
+            }
+            return START_STICKY
+        }
+
+        when (intent.action) {
             ACTION_PAUSE_RESUME -> when {
                 ttsManager.isPlaying -> {
                     ttsManager.pause()
+                    pausedByFocusLoss = false   // user-initiated pause, not focus loss
                     updateSessionState(PlaybackStateCompat.STATE_PAUSED)
                     updateNotification("Tạm dừng", isPlaying = false)
                 }
                 ttsManager.isPaused -> {
-                    ttsManager.resume()   // onPlaybackStarted fires → requestAudioFocus
+                    ttsManager.resume()   // onPlaybackStarted → requestAudioFocus
                     updateSessionState(PlaybackStateCompat.STATE_PLAYING)
                 }
             }
             ACTION_STOP -> {
                 ttsManager.stop()
                 abandonAudioFocus()
+                clearSavedState()
                 updateSessionState(PlaybackStateCompat.STATE_STOPPED)
                 updateNotification("Đã dừng", isPlaying = false)
             }
@@ -161,27 +214,42 @@ class TtsService : Service() {
     // ─── Service-side TTS listener ────────────────────────────────────────────
 
     private val serviceListener = object : TtsManager.Listener {
+
         override fun onInitialized() {
             updateNotification("Sẵn sàng đọc", isPlaying = false)
+            // If we were restarted by the system, restore and resume
+            if (needsRestore) {
+                needsRestore = false
+                val text = loadTextFile()
+                if (!text.isNullOrBlank()) {
+                    ttsManager.setText(text)
+                    ttsManager.seekToChunk(restoreChunk)
+                    ttsManager.play()
+                }
+            }
         }
 
         override fun onPlaybackStarted() {
-            // Request audio focus BEFORE the first chunk is spoken so Android
-            // never silently drops speak() calls in background
             requestAudioFocus()
             if (wakeLock?.isHeld == false) {
-                wakeLock?.acquire(3 * 60 * 60 * 1000L)   // 3-hour safety timeout
+                wakeLock?.acquire(3 * 60 * 60 * 1000L)   // 3-hour safety cap
             }
+            // Persist text so we can restore if the process is killed
+            saveTextFile(ttsManager.getRawText())
+            saveChunk(ttsManager.getCurrentChunkIndex(), playing = true)
             updateSessionState(PlaybackStateCompat.STATE_PLAYING)
         }
 
         override fun onProgress(current: Int, total: Int, percentage: Int) {
+            // Keep saved chunk index up to date for crash recovery
+            saveChunk(ttsManager.getCurrentChunkIndex(), playing = true)
             updateNotification("Đoạn $current / $total", isPlaying = true)
         }
 
         override fun onFinished() {
             releaseWakeLock()
             abandonAudioFocus()
+            clearSavedState()
             updateSessionState(PlaybackStateCompat.STATE_STOPPED)
             updateNotification("Đã đọc xong ✓", isPlaying = false)
             if (!isBound) stopSelf()
@@ -190,6 +258,7 @@ class TtsService : Service() {
         override fun onError(message: String) {
             releaseWakeLock()
             abandonAudioFocus()
+            clearSavedState()
             updateSessionState(PlaybackStateCompat.STATE_ERROR)
             updateNotification("Lỗi: $message", isPlaying = false)
         }
@@ -205,12 +274,14 @@ class TtsService : Service() {
                 }
                 override fun onPause() {
                     ttsManager.pause()
+                    pausedByFocusLoss = false
                     updateSessionState(PlaybackStateCompat.STATE_PAUSED)
                     updateNotification("Tạm dừng", isPlaying = false)
                 }
                 override fun onStop() {
                     ttsManager.stop()
                     abandonAudioFocus()
+                    clearSavedState()
                     updateSessionState(PlaybackStateCompat.STATE_STOPPED)
                     updateNotification("Đã dừng", isPlaying = false)
                 }
@@ -256,6 +327,7 @@ class TtsService : Service() {
                         .build()
                 )
                 .setOnAudioFocusChangeListener(onAudioFocusChange)
+                .setAcceptsDelayedFocusGain(true)   // accept if focus is delayed (call ending etc.)
                 .build()
             audioFocusRequest = req
             hasAudioFocus = am.requestAudioFocus(req) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
@@ -286,6 +358,32 @@ class TtsService : Service() {
 
     private fun releaseWakeLock() {
         if (wakeLock?.isHeld == true) wakeLock?.release()
+    }
+
+    // ─── State persistence (crash / process-kill recovery) ───────────────────
+
+    private fun saveTextFile(text: String) {
+        try { File(filesDir, TEXT_FILE).writeText(text) } catch (_: Exception) { }
+    }
+
+    private fun loadTextFile(): String? {
+        return try {
+            val f = File(filesDir, TEXT_FILE)
+            if (f.exists()) f.readText().takeIf { it.isNotBlank() } else null
+        } catch (_: Exception) { null }
+    }
+
+    private fun saveChunk(chunk: Int, playing: Boolean) {
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putInt(KEY_CHUNK, chunk)
+            .putBoolean(KEY_PLAYING, playing)
+            .apply()
+    }
+
+    private fun clearSavedState() {
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_PLAYING, false)
+            .apply()
     }
 
     // ─── Notification ────────────────────────────────────────────────────────
