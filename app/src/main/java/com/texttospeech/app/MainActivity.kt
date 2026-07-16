@@ -157,21 +157,15 @@ class MainActivity : AppCompatActivity() {
 
         binding.spinnerLang.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
-                val locale = when (pos) {
-                    0    -> Locale("vi", "VN")
-                    1    -> Locale.ENGLISH
-                    else -> detectLocale()
+                val mgr = tts ?: return
+                when (pos) {
+                    0    -> { mgr.setAutoLanguage(false); mgr.setLanguage(Locale("vi", "VN")) }
+                    1    -> { mgr.setAutoLanguage(false); mgr.setLanguage(Locale.ENGLISH) }
+                    else -> { mgr.setAutoLanguage(true) }
                 }
-                tts?.setLanguage(locale)
             }
             override fun onNothingSelected(p: AdapterView<*>?) {}
         }
-    }
-
-    private fun detectLocale(): Locale {
-        val text = binding.etContent.text?.toString() ?: return Locale("vi", "VN")
-        val viChars = "àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ"
-        return if (text.lowercase().any { it in viChars }) Locale("vi", "VN") else Locale.ENGLISH
     }
 
     // ─── Text area ───────────────────────────────────────────────────────────

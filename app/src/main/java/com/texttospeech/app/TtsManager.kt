@@ -13,6 +13,8 @@ import java.util.Locale
  *    → better prosody / intonation per sentence, natural inter-sentence pauses
  *  - Explicit sequential triggering in onDone — no reliance on QUEUE_ADD
  *    which can be silently dropped on some Android versions / engine combinations
+ *  - Auto-language mode — [LanguageDetector] labels each word-group with the
+ *    correct locale (VI / EN) so the TTS engine switches voice mid-document
  */
 class TtsManager(private val context: Context) {
 
@@ -43,6 +45,11 @@ class TtsManager(private val context: Context) {
         const val DEFAULT_SPEED  = 1.0f
     }
 
+    // ─── Internal chunk type ─────────────────────────────────────────────────
+
+    /** A single TTS utterance with the locale to apply before speaking. */
+    private data class Chunk(val text: String, val locale: Locale)
+
     // ─── State ───────────────────────────────────────────────────────────────
 
     private var tts: TextToSpeech? = null
@@ -51,11 +58,18 @@ class TtsManager(private val context: Context) {
     @Volatile var isPlaying     = false; private set
     @Volatile var isPaused      = false; private set
 
-    private var chunks                     = emptyList<String>()
+    private var chunks                      = emptyList<Chunk>()
     @Volatile private var currentChunkIndex = 0
 
-    private var speechRate    = DEFAULT_SPEED
-    private var currentLocale = Locale("vi", "VN")
+    private var speechRate              = DEFAULT_SPEED
+    private var currentLocale           = Locale("vi", "VN")
+    @Volatile private var autoLanguage  = false
+
+    /**
+     * Locale currently loaded in the TTS engine.
+     * Null = unknown / needs to be (re-)applied before the next speak() call.
+     */
+    private var activeSpeakingLocale: Locale? = null
 
     // ─── Initialisation ──────────────────────────────────────────────────────
 
@@ -82,7 +96,7 @@ class TtsManager(private val context: Context) {
                 currentChunkIndex = idx
                 val pct = ((idx + 1) * 100) / chunks.size.coerceAtLeast(1)
                 eachListener { onProgress(idx + 1, chunks.size, pct) }
-                eachListener { onChunkStart(chunks.getOrElse(idx) { "" }, idx) }
+                eachListener { onChunkStart(chunks.getOrElse(idx) { Chunk("", currentLocale) }.text, idx) }
             }
 
             override fun onDone(utteranceId: String?) {
@@ -133,6 +147,7 @@ class TtsManager(private val context: Context) {
         if (chunks.isEmpty()) { eachListener { onError("Chưa có nội dung để đọc.") }; return }
         isPlaying = true
         isPaused  = false
+        activeSpeakingLocale = null   // force locale application on first chunk
         speakChunk(currentChunkIndex)
     }
 
@@ -147,6 +162,7 @@ class TtsManager(private val context: Context) {
         if (!isPaused) return
         isPaused  = false
         isPlaying = true
+        activeSpeakingLocale = null   // force locale re-application after pause
         speakChunk(currentChunkIndex)
     }
 
@@ -164,6 +180,7 @@ class TtsManager(private val context: Context) {
         if (wasPlaying) {
             isPlaying = true
             isPaused  = false
+            activeSpeakingLocale = null   // force locale re-application after seek
             speakChunk(currentChunkIndex)
         }
     }
@@ -177,13 +194,22 @@ class TtsManager(private val context: Context) {
 
     fun setLanguage(locale: Locale) {
         currentLocale = locale
-        if (isInitialized) applyLocale(locale)
+        if (isInitialized) {
+            applyLocale(locale)
+            activeSpeakingLocale = locale
+        }
+    }
+
+    /** Enable/disable automatic per-word-group language detection (VI vs EN). */
+    fun setAutoLanguage(enabled: Boolean) {
+        autoLanguage = enabled
     }
 
     private fun applyLocale(locale: Locale) {
         val result = tts?.setLanguage(locale)
         if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
             tts?.setLanguage(Locale.ENGLISH)
+            activeSpeakingLocale = Locale.ENGLISH
             eachListener { onError("Ngôn ngữ ${locale.displayName} chưa được hỗ trợ — dùng tiếng Anh.") }
         }
     }
@@ -192,33 +218,52 @@ class TtsManager(private val context: Context) {
 
     private fun speakChunk(index: Int) {
         if (index < 0 || index >= chunks.size || !isInitialized) return
-        tts?.speak(chunks[index], TextToSpeech.QUEUE_FLUSH, Bundle(), "chunk_$index")
+        val chunk = chunks[index]
+        // Only call setLanguage() when the locale actually changes to avoid latency
+        if (chunk.locale != activeSpeakingLocale) {
+            applyLocale(chunk.locale)
+            activeSpeakingLocale = chunk.locale
+        }
+        tts?.speak(chunk.text, TextToSpeech.QUEUE_FLUSH, Bundle(), "chunk_$index")
     }
 
     private fun parseIdx(id: String?) = id?.removePrefix("chunk_")?.toIntOrNull()
 
-    // ─── Sentence-level chunking ─────────────────────────────────────────────
+    // ─── Chunking ────────────────────────────────────────────────────────────
 
     /**
-     * Splits text into sentence-level chunks so each [speakChunk] call covers
-     * exactly one sentence.  Benefits:
-     *  1. The TTS engine applies its own prosody model per sentence → more natural
-     *     intonation and rhythm for each sentence.
-     *  2. The ~80 ms gap between consecutive speak() calls acts as a natural
-     *     inter-sentence pause — no artificial silence injection needed.
-     *  3. Very long single sentences (> MAX_CHUNK_SIZE) are split at word
-     *     boundaries as a safety fallback.
+     * Builds the ordered list of chunks to speak.
+     *
+     * **Auto-language mode** ([autoLanguage] = true):
+     *   [LanguageDetector] first splits the text into locale-labelled segments;
+     *   each segment is then sentence-split independently.  This enables the TTS
+     *   engine to switch voice mid-document at word-group boundaries.
+     *
+     * **Single-language mode** ([autoLanguage] = false):
+     *   The full text is split into sentences, all using [currentLocale].
      */
-    private fun buildChunks(text: String): List<String> {
-        val sentences = splitSentences(text)
-        val result    = mutableListOf<String>()
-        for (sent in sentences) {
+    private fun buildChunks(text: String): List<Chunk> {
+        return if (autoLanguage) {
+            LanguageDetector.segmentText(text, currentLocale)
+                .flatMap { seg -> buildMonolingualChunks(seg.text, seg.locale) }
+        } else {
+            buildMonolingualChunks(text, currentLocale)
+        }
+    }
+
+    /**
+     * Splits [text] into sentence-level [Chunk]s all labelled with [locale].
+     * Sentences longer than [MAX_CHUNK_SIZE] are further split at word boundaries.
+     */
+    private fun buildMonolingualChunks(text: String, locale: Locale): List<Chunk> {
+        val result = mutableListOf<Chunk>()
+        for (sent in splitSentences(text)) {
             val s = sent.trim()
             if (s.isBlank()) continue
             if (s.length > MAX_CHUNK_SIZE) {
-                result += splitByWords(s)
+                splitByWords(s).forEach { result += Chunk(it, locale) }
             } else {
-                result += s
+                result += Chunk(s, locale)
             }
         }
         return result
