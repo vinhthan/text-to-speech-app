@@ -100,7 +100,7 @@ object TextNormalizer {
         t = t.replace(Regex("""\.{4,}"""), "... ")
         // Multiple exclamation / question → single
         t = t.replace(Regex("""!{2,}"""), "!")
-        t = t.replace(Regex("""?{2,}"""), "?")
+        t = t.replace(Regex("""\?{2,}"""), "?")
         // Bullet characters → newline (natural pause via paragraph break)
         t = t.replace(Regex("""[•·◦▪▸►✓✗]\s*"""), "\n")
         // Remove remaining control / box-drawing chars

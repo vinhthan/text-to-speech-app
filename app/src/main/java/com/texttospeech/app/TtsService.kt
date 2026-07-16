@@ -5,8 +5,8 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.content.ComponentName
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -56,7 +56,17 @@ class TtsService : Service() {
         ttsManager = TtsManager(this)
         ttsManager.addListener(serviceListener)
         ttsManager.init()
-        startForeground(NOTIF_ID, buildNotification("Sẵn sàng đọc", isPlaying = false))
+        // Android 10+ (API 29+): must pass the foreground service type;
+        // Android 14 (API 34+): mandatory when type is declared in the manifest.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIF_ID,
+                buildNotification("Sẵn sàng đọc", isPlaying = false),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+            )
+        } else {
+            startForeground(NOTIF_ID, buildNotification("Sẵn sàng đọc", isPlaying = false))
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
