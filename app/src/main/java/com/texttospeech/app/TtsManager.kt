@@ -9,9 +9,10 @@ import java.util.Locale
 /**
  * Wraps Android TextToSpeech with:
  *  - Listener-based callbacks (multiple observers supported)
- *  - Sentence-aware chunking — never cuts mid-sentence
- *  - QUEUE_ADD pre-queuing — eliminates silence gaps between chunks
- *  - TextNormalizer integration for cleaner input
+ *  - Sentence-level chunking — each sentence is its own TTS utterance
+ *    → better prosody / intonation per sentence, natural inter-sentence pauses
+ *  - Explicit sequential triggering in onDone — no reliance on QUEUE_ADD
+ *    which can be silently dropped on some Android versions / engine combinations
  */
 class TtsManager(private val context: Context) {
 
@@ -35,6 +36,7 @@ class TtsManager(private val context: Context) {
     // ─── Constants ───────────────────────────────────────────────────────────
 
     companion object {
+        /** Hard limit for a single TTS utterance (safety net for giant sentences). */
         const val MAX_CHUNK_SIZE = 3000
         const val MIN_SPEED      = 0.1f
         const val MAX_SPEED      = 4.0f
@@ -49,12 +51,11 @@ class TtsManager(private val context: Context) {
     @Volatile var isPlaying     = false; private set
     @Volatile var isPaused      = false; private set
 
-    private var chunks           = emptyList<String>()
+    private var chunks                     = emptyList<String>()
     @Volatile private var currentChunkIndex = 0
-    @Volatile private var preQueuedUpTo     = -1
 
-    private var speechRate     = DEFAULT_SPEED
-    private var currentLocale  = Locale("vi", "VN")
+    private var speechRate    = DEFAULT_SPEED
+    private var currentLocale = Locale("vi", "VN")
 
     // ─── Initialisation ──────────────────────────────────────────────────────
 
@@ -82,25 +83,28 @@ class TtsManager(private val context: Context) {
                 val pct = ((idx + 1) * 100) / chunks.size.coerceAtLeast(1)
                 eachListener { onProgress(idx + 1, chunks.size, pct) }
                 eachListener { onChunkStart(chunks.getOrElse(idx) { "" }, idx) }
-                // Keep the pipeline: pre-queue the chunk after the one already queued
-                preQueueNext(preQueuedUpTo)
             }
 
             override fun onDone(utteranceId: String?) {
                 if (isPaused) return
                 val idx = parseIdx(utteranceId) ?: return
                 if (idx >= chunks.size - 1) {
-                    // Last chunk finished
+                    // All sentences finished
                     isPlaying = false
                     currentChunkIndex = 0
                     eachListener { onFinished() }
+                } else {
+                    // Explicitly trigger next sentence — never rely on QUEUE_ADD
+                    // (QUEUE_ADD is silently dropped on some engines/Android versions)
+                    val next = idx + 1
+                    currentChunkIndex = next
+                    speakChunk(next)
                 }
-                // else: next chunk is already playing from the queue — nothing to do
             }
 
             @Deprecated("Deprecated in newer API")
             override fun onError(utteranceId: String?) {
-                if (isPlaying) eachListener { onError("Lỗi TTS khi đọc đoạn văn.") }
+                if (isPlaying) eachListener { onError("Lỗi TTS khi đọc câu.") }
             }
 
             override fun onError(utteranceId: String?, errorCode: Int) {
@@ -129,9 +133,7 @@ class TtsManager(private val context: Context) {
         if (chunks.isEmpty()) { eachListener { onError("Chưa có nội dung để đọc.") }; return }
         isPlaying = true
         isPaused  = false
-        preQueuedUpTo = -1
-        speakAt(currentChunkIndex, TextToSpeech.QUEUE_FLUSH)
-        preQueueNext(currentChunkIndex)
+        speakChunk(currentChunkIndex)
     }
 
     fun pause() {
@@ -143,11 +145,9 @@ class TtsManager(private val context: Context) {
 
     fun resume() {
         if (!isPaused) return
-        isPaused      = false
-        isPlaying     = true
-        preQueuedUpTo = -1
-        speakAt(currentChunkIndex, TextToSpeech.QUEUE_FLUSH)
-        preQueueNext(currentChunkIndex)
+        isPaused  = false
+        isPlaying = true
+        speakChunk(currentChunkIndex)
     }
 
     fun stop() {
@@ -155,19 +155,16 @@ class TtsManager(private val context: Context) {
         isPlaying         = false
         isPaused          = false
         currentChunkIndex = 0
-        preQueuedUpTo     = -1
     }
 
     fun seekToChunk(index: Int) {
-        val was = isPlaying
+        val wasPlaying = isPlaying
         tts?.stop()
         currentChunkIndex = index.coerceIn(0, (chunks.size - 1).coerceAtLeast(0))
-        preQueuedUpTo = -1
-        if (was) {
+        if (wasPlaying) {
             isPlaying = true
             isPaused  = false
-            speakAt(currentChunkIndex, TextToSpeech.QUEUE_FLUSH)
-            preQueueNext(currentChunkIndex)
+            speakChunk(currentChunkIndex)
         }
     }
 
@@ -191,70 +188,53 @@ class TtsManager(private val context: Context) {
         }
     }
 
-    // ─── Internal playback helpers ───────────────────────────────────────────
+    // ─── Internal helpers ────────────────────────────────────────────────────
 
-    /** Speak chunk[index] with the given queue mode and track preQueuedUpTo. */
-    private fun speakAt(index: Int, queueMode: Int) {
+    private fun speakChunk(index: Int) {
         if (index < 0 || index >= chunks.size || !isInitialized) return
-        tts?.speak(chunks[index], queueMode, Bundle(), "chunk_$index")
-        if (index > preQueuedUpTo) preQueuedUpTo = index
-    }
-
-    /** Queue the next unqueued chunk using QUEUE_ADD for gap-free playback. */
-    private fun preQueueNext(after: Int) {
-        val next = after + 1
-        if (next < chunks.size && next > preQueuedUpTo) {
-            tts?.speak(chunks[next], TextToSpeech.QUEUE_ADD, Bundle(), "chunk_$next")
-            preQueuedUpTo = next
-        }
+        tts?.speak(chunks[index], TextToSpeech.QUEUE_FLUSH, Bundle(), "chunk_$index")
     }
 
     private fun parseIdx(id: String?) = id?.removePrefix("chunk_")?.toIntOrNull()
 
-    // ─── Sentence-aware chunking ──────────────────────────────────────────────
+    // ─── Sentence-level chunking ─────────────────────────────────────────────
 
     /**
-     * Splits text into TTS-safe chunks (≤ MAX_CHUNK_SIZE chars) that always
-     * break at sentence boundaries — never mid-word or mid-sentence.
+     * Splits text into sentence-level chunks so each [speakChunk] call covers
+     * exactly one sentence.  Benefits:
+     *  1. The TTS engine applies its own prosody model per sentence → more natural
+     *     intonation and rhythm for each sentence.
+     *  2. The ~80 ms gap between consecutive speak() calls acts as a natural
+     *     inter-sentence pause — no artificial silence injection needed.
+     *  3. Very long single sentences (> MAX_CHUNK_SIZE) are split at word
+     *     boundaries as a safety fallback.
      */
     private fun buildChunks(text: String): List<String> {
-        if (text.length <= MAX_CHUNK_SIZE) return listOf(text).filter { it.isNotBlank() }
-
         val sentences = splitSentences(text)
         val result    = mutableListOf<String>()
-        val buf       = StringBuilder()
-
-        for (sentence in sentences) {
-            when {
-                sentence.length > MAX_CHUNK_SIZE -> {
-                    // Exceptionally long single sentence → split at word boundaries
-                    if (buf.isNotBlank()) { result += buf.toString().trim(); buf.clear() }
-                    result += splitByWords(sentence)
-                }
-                buf.length + sentence.length > MAX_CHUNK_SIZE -> {
-                    if (buf.isNotBlank()) result += buf.toString().trim()
-                    buf.clear()
-                    buf.append(sentence)
-                }
-                else -> buf.append(sentence)
+        for (sent in sentences) {
+            val s = sent.trim()
+            if (s.isBlank()) continue
+            if (s.length > MAX_CHUNK_SIZE) {
+                result += splitByWords(s)
+            } else {
+                result += s
             }
         }
-        if (buf.isNotBlank()) result += buf.toString().trim()
-        return result.filter { it.isNotBlank() }
+        return result
     }
 
     /**
      * Splits text at natural sentence boundaries:
-     *  . ! ? ！ ？ 。 followed by whitespace, OR paragraph breaks (\n\n)
+     *  . ! ? ！ ？ 。 followed by whitespace, OR paragraph breaks (\n\n+)
      */
     private fun splitSentences(text: String): List<String> {
-        // Insert a marker after every sentence-ending boundary
         val marked = text
-            .replace(Regex("""([.!?！？。])\s+"""))  { "${it.groupValues[1]}\u0000" }
+            .replace(Regex("""([.!?！？。])\s+""")) { "${it.groupValues[1]}\u0000" }
             .replace(Regex("""\n{2,}"""), "\n\n\u0000")
 
         return marked.split("\u0000")
-            .map { it.replace("\u0000", "") }
+            .map { it.replace("\u0000", "").trim() }
             .filter { it.isNotBlank() }
     }
 
