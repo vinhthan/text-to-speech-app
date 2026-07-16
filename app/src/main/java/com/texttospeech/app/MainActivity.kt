@@ -47,7 +47,6 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        FileReaderUtil.init(this)
         bookmarks = BookmarkManager(this)
         history   = HistoryManager(this)
 
