@@ -190,7 +190,7 @@
                 android:layout_marginBottom="8dp"
                 android:layout_marginTop="4dp"
                 android:visibility="gone"
-                app:indeterminate="true"
+                android:indeterminate="true"
                 app:trackCornerRadius="4dp" />
 
             <!-- ────────────────────────────────────────────────────────────
