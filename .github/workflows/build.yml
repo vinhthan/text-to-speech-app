@@ -21,6 +21,9 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
       - name: Setup Gradle 8.4
         uses: gradle/actions/setup-gradle@v3
         with:
@@ -32,15 +35,23 @@ jobs:
       - name: Grant execute permission to gradlew
         run: chmod +x gradlew
 
+      - name: Write local.properties
+        run: echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Install required SDK platforms
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
       - name: Build Debug APK
         run: ./gradlew assembleDebug --stacktrace
-        env:
-          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
 
       - name: Rename APK
         run: |
           mkdir -p release
-          cp app/build/outputs/apk/debug/app-debug.apk release/TextToSpeech-v${{ github.run_number }}.apk
+          cp app/build/outputs/apk/debug/app-debug.apk \
+             release/TextToSpeech-v${{ github.run_number }}.apk
 
       - name: Upload APK as artifact
         uses: actions/upload-artifact@v4
@@ -58,18 +69,19 @@ jobs:
             ## 🔊 Text to Speech Android App — Debug Build
 
             ### Cách cài đặt trên điện thoại:
-            1. **Tải file** `TextToSpeech-v${{ github.run_number }}.apk` bên dưới (mục Assets)
-            2. Trên điện thoại: vào **Cài đặt → Bảo mật → Bật "Nguồn không xác định"**
-               (hoặc Android 8+: khi mở APK sẽ hỏi, chọn "Cho phép")
+            1. **Tải file** `TextToSpeech-v${{ github.run_number }}.apk` bên dưới (mục **Assets**)
+            2. Trên điện thoại vào **Cài đặt → Bảo mật → Bật "Nguồn không xác định"**
+               _(Android 8+: khi mở APK sẽ tự hỏi, chọn "Cho phép")_
             3. Mở file APK vừa tải → nhấn **Cài đặt**
-            4. Yêu cầu: Android 7.0+ và **Google Text-to-Speech** (hầu hết đã có sẵn)
+            4. Yêu cầu: **Android 7.0+** và **Google Text-to-Speech** (hầu hết đã có sẵn)
 
             ### Tính năng:
-            - 🇻🇳🇺🇸 Đọc tiếng Việt & tiếng Anh (tự nhận diện)
+            - 🇻🇳🇺🇸 Đọc tiếng Việt & tiếng Anh (tự nhận diện ngôn ngữ)
             - 📂 Mở file TXT, PDF, DOCX, ODT, RTF
-            - ⚡ Điều chỉnh tốc độ 0.1x – 4.0x (±0.1x mỗi bước)
-            - 🔖 Bookmark vị trí đọc
-            - 📋 Lịch sử file đã đọc
+            - ⚡ Điều chỉnh tốc độ 0.1x – 4.0x (bước ±0.1x)
+            - ⏸ Play / Pause / Stop — nhớ vị trí khi tạm dừng
+            - 🔖 Bookmark vị trí đọc (tối đa 50 bookmark)
+            - 📋 Lịch sử file đã đọc (30 mục gần nhất)
             - 🌙 Dark mode / Light mode
           files: release/*.apk
           draft: false
