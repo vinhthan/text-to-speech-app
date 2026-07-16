@@ -205,6 +205,30 @@ class TtsManager(private val context: Context) {
     }
 
     /**
+     * Returns all installed (non-network) voices for [locale], sorted by quality descending.
+     * Used to populate the voice-picker dialog in the UI.
+     */
+    fun getVoicesForLocale(locale: Locale): List<android.speech.tts.Voice> =
+        tts?.voices
+            ?.filter { v ->
+                v.locale.language == locale.language &&
+                !v.isNetworkConnectionRequired &&
+                !v.features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
+            }
+            ?.sortedByDescending { it.quality }
+            ?: emptyList()
+
+    /** The voice currently active in the engine, or null if not yet initialized. */
+    fun getCurrentVoice(): android.speech.tts.Voice? = tts?.voice
+
+    /** Applies [voice] immediately and updates the best-voice cache for its language. */
+    fun setVoice(voice: android.speech.tts.Voice) {
+        tts?.voice = voice
+        bestVoiceCache[voice.locale.language] = voice
+        activeSpeakingLocale = null   // force locale/voice re-apply on next speak
+    }
+
+    /**
      * Applies [locale] to the TTS engine and selects the best available voice.
      * @return the locale that was actually applied (may fall back to English if
      *         the requested locale is not installed).

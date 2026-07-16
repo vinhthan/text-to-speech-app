@@ -70,6 +70,7 @@ class MainActivity : AppCompatActivity() {
     private val activityListener = object : TtsManager.Listener {
         override fun onInitialized() = runOnUiThread {
             binding.btnPlay.isEnabled = true
+            updateVoiceLabel()
             toast("Text-to-Speech sẵn sàng")
         }
         override fun onProgress(current: Int, total: Int, percentage: Int) = runOnUiThread {
@@ -156,7 +157,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ─── Language ────────────────────────────────────────────────────────────
+    // ─── Language + Voice ────────────────────────────────────────────────────
 
     private fun setupLanguageSpinner() {
         val langs = arrayOf("🇻🇳 Tiếng Việt", "🇺🇸 English", "🌐 Tự động nhận diện")
@@ -172,9 +173,64 @@ class MainActivity : AppCompatActivity() {
                     1    -> { mgr.setAutoLanguage(false); mgr.setLanguage(Locale.ENGLISH) }
                     else -> { mgr.setAutoLanguage(true) }
                 }
+                updateVoiceLabel()
             }
             override fun onNothingSelected(p: AdapterView<*>?) {}
         }
+
+        binding.btnVoicePick.setOnClickListener { showVoicePicker() }
+    }
+
+    private fun updateVoiceLabel() {
+        val voice = tts?.getCurrentVoice()
+        binding.tvVoiceLabel.text = if (voice != null) {
+            "🎤 ${voiceDisplayName(voice)}"
+        } else {
+            "🎤 Giọng đọc: Mặc định"
+        }
+    }
+
+    private fun showVoicePicker() {
+        val mgr = tts ?: run { toast("TTS chưa sẵn sàng"); return }
+        val locale = mgr.getCurrentLocale()
+        val voices = mgr.getVoicesForLocale(locale)
+
+        if (voices.isEmpty()) {
+            toast("Không tìm thấy voice nào — hãy cài Google TTS")
+            return
+        }
+
+        val current  = mgr.getCurrentVoice()
+        val labels   = voices.map { voiceDisplayName(it) }.toTypedArray()
+        val checkedIdx = voices.indexOfFirst { it.name == current?.name }.coerceAtLeast(0)
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle("🎤 Chọn giọng đọc")
+            .setSingleChoiceItems(labels, checkedIdx) { dialog, which ->
+                mgr.setVoice(voices[which])
+                updateVoiceLabel()
+                dialog.dismiss()
+                toast("Đã chọn: ${voiceDisplayName(voices[which])}")
+            }
+            .setNegativeButton("Hủy", null)
+            .show()
+    }
+
+    /** Formats a TTS Voice into a human-readable label. */
+    private fun voiceDisplayName(voice: android.speech.tts.Voice): String {
+        val name = voice.name
+        // Google TTS naming: "vi-vn-x-vif-local" → "f" suffix = female
+        val isFemale = name.matches(Regex(".*[a-z]f-(?:local|network)$")) ||
+                       name.contains("female", ignoreCase = true)
+        val gender  = if (isFemale) "♀" else "♂"
+        val quality = when {
+            voice.quality >= 400 -> "Rất cao"
+            voice.quality >= 300 -> "Cao"
+            voice.quality >= 200 -> "Thường"
+            else                 -> "Thấp"
+        }
+        val shortName = name.removeSuffix("-local").removeSuffix("-network")
+        return "$shortName  $gender  [$quality]"
     }
 
     // ─── Text area ───────────────────────────────────────────────────────────

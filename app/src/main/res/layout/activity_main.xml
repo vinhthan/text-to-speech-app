@@ -63,23 +63,61 @@
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:orientation="horizontal"
-                    android:padding="14dp"
-                    android:gravity="center_vertical">
+                    android:orientation="vertical"
+                    android:padding="14dp">
 
-                    <TextView
-                        android:layout_width="wrap_content"
+                    <!-- Row 1: language selector -->
+                    <LinearLayout
+                        android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:text="🌐 Ngôn ngữ"
-                        android:textStyle="bold"
-                        android:textSize="14sp"
-                        android:layout_marginEnd="12dp" />
+                        android:orientation="horizontal"
+                        android:gravity="center_vertical">
 
-                    <Spinner
-                        android:id="@+id/spinnerLang"
-                        android:layout_width="0dp"
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="🌐 Ngôn ngữ"
+                            android:textStyle="bold"
+                            android:textSize="14sp"
+                            android:layout_marginEnd="12dp" />
+
+                        <Spinner
+                            android:id="@+id/spinnerLang"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1" />
+
+                    </LinearLayout>
+
+                    <!-- Row 2: voice picker -->
+                    <LinearLayout
+                        android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:layout_weight="1" />
+                        android:orientation="horizontal"
+                        android:gravity="center_vertical"
+                        android:layout_marginTop="10dp">
+
+                        <TextView
+                            android:id="@+id/tvVoiceLabel"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="🎤 Giọng đọc: Mặc định"
+                            android:textSize="13sp"
+                            android:textColor="?attr/colorOnSurfaceVariant"
+                            android:ellipsize="end"
+                            android:maxLines="1" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnVoicePick"
+                            style="@style/Widget.Material3.Button.OutlinedButton"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginStart="8dp"
+                            android:text="Chọn giọng"
+                            android:textSize="12sp" />
+
+                    </LinearLayout>
 
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
@@ -122,6 +160,9 @@
                             android:hint="Paste nội dung vào đây hoặc mở file bên dưới…"
                             android:inputType="textMultiLine"
                             android:scrollbars="vertical"
+                            android:fadeScrollbars="false"
+                            android:scrollbarSize="6dp"
+                            android:scrollbarStyle="insideOverlay"
                             android:overScrollMode="always"
                             android:textSize="15sp"
                             android:lineSpacingMultiplier="1.4" />
