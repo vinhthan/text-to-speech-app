@@ -15,6 +15,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
+import android.widget.SeekBar
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -37,6 +38,8 @@ class MainActivity : AppCompatActivity() {
 
     private var currentFileName = "Văn bản thủ công"
     private var isDark = false
+    /** True while the user is dragging the seek bar — suppresses progress updates. */
+    private var isSeeking = false
 
     // ─── Service binding ─────────────────────────────────────────────────────
 
@@ -72,12 +75,17 @@ class MainActivity : AppCompatActivity() {
         override fun onProgress(current: Int, total: Int, percentage: Int) = runOnUiThread {
             binding.progressBar.progress = percentage
             binding.tvProgress.text = "Đoạn $current / $total"
+            if (!isSeeking) {
+                binding.seekBar.max      = (total - 1).coerceAtLeast(0)
+                binding.seekBar.progress = current - 1
+            }
         }
         override fun onChunkStart(text: String, index: Int) = Unit
         override fun onFinished() = runOnUiThread {
             setPlaybackUi(playing = false, paused = false)
             binding.tvProgress.text = "Đã đọc xong ✓"
             binding.progressBar.progress = 100
+            binding.seekBar.progress = binding.seekBar.max
         }
         override fun onError(message: String) = runOnUiThread { toast(message) }
     }
@@ -104,6 +112,7 @@ class MainActivity : AppCompatActivity() {
         setupFileControls()
         setupSpeedControls()
         setupPlaybackButtons()
+        setupSeekBar()
         setupUtilButtons()
         updateSpeedDisplay()
     }
@@ -304,6 +313,9 @@ class MainActivity : AppCompatActivity() {
                     history.add(currentFileName, raw)
                     val normalized = TextNormalizer.normalize(raw, mgr.getCurrentLocale())
                     mgr.setText(normalized)
+                    // Initialise seek bar range now that chunks are built
+                    binding.seekBar.max      = (mgr.getTotalChunks() - 1).coerceAtLeast(0)
+                    binding.seekBar.progress = 0
                     mgr.play()
                     setPlaybackUi(playing = true, paused = false)
                 }
@@ -322,8 +334,35 @@ class MainActivity : AppCompatActivity() {
             tts?.stop()
             setPlaybackUi(playing = false, paused = false)
             binding.progressBar.progress = 0
+            binding.seekBar.progress = 0
             binding.tvProgress.text = "Sẵn sàng"
         }
+    }
+
+    // ─── Seek bar ────────────────────────────────────────────────────────────
+
+    private fun setupSeekBar() {
+        binding.seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onStartTrackingTouch(seekBar: SeekBar) {
+                isSeeking = true
+            }
+            override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
+                if (fromUser) {
+                    val total = (seekBar.max + 1).coerceAtLeast(1)
+                    binding.tvProgress.text = "Đoạn ${progress + 1} / $total"
+                }
+            }
+            override fun onStopTrackingTouch(seekBar: SeekBar) {
+                isSeeking = false
+                val mgr = tts ?: return
+                mgr.seekToChunk(seekBar.progress)
+                if (!mgr.isPlaying && !mgr.isPaused) {
+                    // If not currently playing, just update the UI position text
+                    val total = (seekBar.max + 1).coerceAtLeast(1)
+                    binding.tvProgress.text = "Đoạn ${seekBar.progress + 1} / $total"
+                }
+            }
+        })
     }
 
     private fun setPlaybackUi(playing: Boolean, paused: Boolean) {

@@ -301,7 +301,19 @@
                         android:gravity="center"
                         android:text="Sẵn sàng"
                         android:textSize="14sp"
-                        android:paddingBottom="10dp" />
+                        android:paddingBottom="6dp" />
+
+                    <!-- Seek bar — drag to jump to any chunk in the document -->
+                    <SeekBar
+                        android:id="@+id/seekBar"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:max="0"
+                        android:progress="0"
+                        android:paddingBottom="6dp"
+                        android:thumbTint="?attr/colorPrimary"
+                        android:progressTint="?attr/colorPrimary"
+                        android:secondaryProgressTint="?attr/colorPrimaryContainer" />
 
                     <com.google.android.material.progressindicator.LinearProgressIndicator
                         android:id="@+id/progressBar"

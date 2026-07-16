@@ -14,11 +14,12 @@ import java.util.Locale
  *  5. In curated English word list               → English  (the, model, data)
  *  6. Otherwise: ambiguous → resolved by context
  *
- * Ambiguity resolution:
+ * Ambiguity resolution (conservative — prefers the document's default locale):
  *  - Both neighbours agree on locale             → use that locale
- *  - Run of ≥ 3 consecutive ambiguous words with an EN neighbour → English
  *  - Any Vietnamese neighbour present            → Vietnamese (safe default)
- *  - Otherwise inherit nearest neighbour or defaultLocale
+ *  - Sandwiched between two EN blocks            → English
+ *  - Has a left EN neighbour                     → inherit left
+ *  - No left context (start of text)             → use defaultLocale (safe)
  */
 object LanguageDetector {
 
@@ -44,30 +45,33 @@ object LanguageDetector {
         "tion", "sion", "ness", "ment", "ity", "ism", "ist", "acy",
         "ance", "ence", "ize", "ise", "ify", "able", "ible", "less",
         "ful", "ous", "ious", "ing", "ings", "ated", "ational",
-        "ical", "ic", "al", "ly", "er", "ers", "est"
+        "ical", "ic", "al", "ly", "ers", "est"
     )
 
-    // ─── Curated English word list (not Vietnamese words) ────────────────────
+    // ─── Curated English word list ────────────────────────────────────────────
+    // Only includes words unlikely to appear as un-accented Vietnamese words.
+    // Short ambiguous words (e.g. "an"=eat, "do"=by/because-of in VI) are excluded.
 
     private val EN_WORDS = setOf(
-        // Core function words (clearly English, not Vietnamese)
-        "the","and","or","but","in","on","at","to","for","with","of","is","are",
-        "was","were","be","been","have","has","had","do","does","did","will",
-        "would","could","should","may","might","shall","can","not","no",
+        // Core function words (clearly not Vietnamese)
+        "the","and","but","for","with","of","is","are",
+        "was","were","be","been","have","has","had","will",
+        "would","could","should","may","might","shall","can","not",
         "it","its","this","that","these","those","they","them","their","there",
         "then","than","when","where","which","who","what","how","if","as","by",
         "from","up","about","into","through","during","before","after","above",
         "below","between","each","every","both","few","more","most","other",
-        "some","such","only","own","same","so","too","very","just","also",
-        "our","your","his","her","we","you","he","she","an","am","i",
+        "some","such","only","own","same","too","very","just","also",
+        "our","your","his","her","we","you","he","she",
         "because","while","although","however","therefore","thus","even","still",
         "already","yet","here","always","never","often","whether",
-        // Common adjectives / verbs / nouns
-        "new","good","high","large","small","big","great","long","little","own",
+        "or","in","on","at","to","no","so",
+        // Common English adjectives / verbs / nouns (clearly not VI without diacritics)
+        "new","good","high","large","small","big","great","long","little",
         "right","old","next","early","young","important","public","private",
         "real","best","free","open","full","special","easy","clear","true","false",
         "available","main","necessary","general","specific","different","following",
-        "able","based","used","given","known","including","possible","required",
+        "based","used","given","known","including","possible","required",
         "first","second","third","last","many","much","well","back",
         // Technology / programming / AI
         "model","models","data","dataset","machine","learning","deep","neural",
@@ -80,7 +84,7 @@ object LanguageDetector {
         "android","ios","web","server","client","api","json","xml","http","https",
         "url","uri","sql","database","query","index","table","column","row",
         "function","class","method","object","string","int","integer","float",
-        "double","boolean","array","list","map","set","null","true","false",
+        "double","boolean","array","list","map","set","null",
         "async","await","coroutine","thread","process","memory","cpu","gpu","tpu",
         "code","coding","programming","software","hardware","app","application",
         "framework","library","package","module","import","export","build",
@@ -100,10 +104,10 @@ object LanguageDetector {
         "level","levels","case","cases","example","examples","problem","solution",
         "issue","benefit","option","mode","step","steps","phase","stage","state",
         "structure","format","scale","scope","range","rate","speed","quality",
-        "size","number","time","date","day","year","month","hour","minute",
+        "size","number","time","date","year","month","hour","minute",
         // Adjectives (not caught by suffix rules)
         "basic","complex","simple","advanced","standard","custom","manual","auto",
-        "global","local","static","dynamic","real","virtual","physical","digital",
+        "global","local","static","dynamic","virtual","physical","digital",
         "technical","commercial","official","popular","common","typical","normal",
         "current","recent","previous","original","primary","secondary","multiple",
         "single","total","average","maximum","minimum","default","optional"
@@ -112,11 +116,10 @@ object LanguageDetector {
     // ─── Public API ───────────────────────────────────────────────────────────
 
     /**
-     * Splits [text] into segments each labelled with the detected [Locale].
-     * Adjacent words of the same locale are merged into one segment (including
-     * intervening punctuation / spaces).
+     * Splits [text] into locale-labelled segments. Adjacent words of the same
+     * locale are merged, so intervening punctuation/spaces stay with that segment.
      *
-     * @param defaultLocale fallback for words that cannot be classified
+     * @param defaultLocale fallback for ambiguous words with no reliable context
      */
     fun segmentText(text: String, defaultLocale: Locale = VI): List<Segment> {
         val wordRegex = Regex("[\\p{L}]+")
@@ -137,7 +140,7 @@ object LanguageDetector {
         // 1. Contains a Vietnamese diacritic → definitely Vietnamese
         if (lower.any { it in VI_CHARS }) return VI
 
-        // Past this point we only handle ASCII words
+        // Past this point we only handle pure ASCII letter strings
         if (!word.all { it.code < 128 && it.isLetter() }) return null
 
         // 2. ALL_CAPS ≥ 2 letters — acronym (API, GPU, HTTP, AI)
@@ -146,20 +149,23 @@ object LanguageDetector {
         // 3. CamelCase — uppercase letter after position 0 (TensorFlow, PyTorch)
         if (word.length >= 2 && word.drop(1).any { it.isUpperCase() }) return EN
 
-        // 4. English morphological suffix (min length 6 to avoid short VI syllables)
+        // 4. English morphological suffix (min length 6 to avoid matching short VI syllables)
         if (lower.length >= 6 && EN_SUFFIXES.any { lower.endsWith(it) }) return EN
 
         // 5. In curated English word list
         if (lower in EN_WORDS) return EN
 
-        // Ambiguous: short ASCII word not in either list
+        // Ambiguous: short ASCII word not clearly in either language
         return null
     }
 
     // ─── Ambiguity resolution ─────────────────────────────────────────────────
 
     /**
-     * Fills null (ambiguous) slots using neighbour majority and run-length heuristics.
+     * Fills null (ambiguous) slots conservatively.
+     * Prefers [defaultLocale] when there is no left-context to inherit from,
+     * so that Vietnamese text appearing at the start of a document (or sentence)
+     * is never mis-classified as English just because an English word follows it.
      */
     private fun resolveAmbiguous(locales: List<Locale?>, default: Locale): List<Locale> {
         val out = locales.toMutableList()
@@ -169,22 +175,19 @@ object LanguageDetector {
         while (i < n) {
             if (out[i] != null) { i++; continue }
 
-            // Find the full extent of this null run: [i, j)
+            // Extent of this null run: [i, j)
             var j = i + 1
             while (j < n && out[j] == null) j++
 
-            val prev   = if (i > 0) out[i - 1] else null
-            val next   = if (j < n) out[j]     else null
-            val runLen = j - i
+            val prev = if (i > 0) out[i - 1] else null
+            val next = if (j < n) out[j]     else null
 
             val fill: Locale = when {
-                prev != null && prev == next -> prev       // neighbours agree → use them
-                runLen >= 3 && prev == EN   -> EN          // long run after EN → English phrase
-                runLen >= 3 && next == EN   -> EN          // long run before EN → English phrase
-                prev == VI || next == VI    -> VI          // any VI neighbour → safe fallback
-                prev != null               -> prev         // inherit left
-                next != null               -> next         // inherit right
-                else                       -> default
+                prev != null && prev == next -> prev   // both neighbours agree → use them
+                prev == VI   || next == VI   -> VI     // any VI neighbour → stay Vietnamese
+                prev == EN   && next == EN   -> EN     // sandwiched between EN blocks
+                prev != null               -> prev     // inherit left neighbour's locale
+                else                       -> default  // no left context → safe document default
             }
 
             for (k in i until j) out[k] = fill
@@ -198,9 +201,8 @@ object LanguageDetector {
     // ─── Segment builder ──────────────────────────────────────────────────────
 
     /**
-     * Walks word matches left-to-right; whenever the locale changes, the current
-     * text span (including preceding non-word characters) is flushed as a [Segment].
-     * Non-word spans (spaces, punctuation) are appended to the current locale naturally.
+     * Walks word matches left-to-right. On each locale boundary, flush the
+     * current text span (including preceding non-word characters) as a [Segment].
      */
     private fun buildSegments(
         text: String,
@@ -221,7 +223,6 @@ object LanguageDetector {
             }
         }
 
-        // Tail: remaining text from segStart to end
         val tail = text.substring(segStart)
         if (tail.isNotBlank()) segments += Segment(tail, curLocale)
 
