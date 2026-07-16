@@ -47,6 +47,22 @@ class TtsManager(private val context: Context) {
         const val DEFAULT_SPEED  = 1.0f
     }
 
+    // ─── Voice metadata ───────────────────────────────────────────────────────
+
+    enum class VoiceStatus {
+        /** Downloaded and works offline. */
+        LOCAL,
+        /** Works immediately but requires an internet connection. */
+        NETWORK,
+        /** Known to the engine but not yet downloaded — user must install it. */
+        NOT_INSTALLED
+    }
+
+    data class VoiceItem(
+        val voice: android.speech.tts.Voice,
+        val status: VoiceStatus
+    )
+
     // ─── Internal chunk type ─────────────────────────────────────────────────
 
     private data class Chunk(val text: String, val locale: Locale)
@@ -205,18 +221,28 @@ class TtsManager(private val context: Context) {
     }
 
     /**
-     * Returns all installed (non-network) voices for [locale], sorted by quality descending.
-     * Used to populate the voice-picker dialog in the UI.
+     * Returns **all** voices for [locale] — local offline, network (online), and
+     * not-yet-downloaded — so the UI can present the full picture to the user.
+     * Sorted by: installed first, then by quality descending.
      */
-    fun getVoicesForLocale(locale: Locale): List<android.speech.tts.Voice> =
-        tts?.voices
-            ?.filter { v ->
-                v.locale.language == locale.language &&
-                !v.isNetworkConnectionRequired &&
-                !v.features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
+    fun getVoicesForLocale(locale: Locale): List<VoiceItem> {
+        val notInstalledKey = TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED
+        return tts?.voices
+            ?.filter { v -> v.locale.language == locale.language }
+            ?.map { v ->
+                val status = when {
+                    v.features.contains(notInstalledKey) -> VoiceStatus.NOT_INSTALLED
+                    v.isNetworkConnectionRequired        -> VoiceStatus.NETWORK
+                    else                                 -> VoiceStatus.LOCAL
+                }
+                VoiceItem(v, status)
             }
-            ?.sortedByDescending { it.quality }
+            ?.sortedWith(
+                compareBy<VoiceItem> { it.status.ordinal }       // LOCAL < NETWORK < NOT_INSTALLED
+                    .thenByDescending { it.voice.quality }
+            )
             ?: emptyList()
+    }
 
     /** The voice currently active in the engine, or null if not yet initialized. */
     fun getCurrentVoice(): android.speech.tts.Voice? = tts?.voice

@@ -192,40 +192,73 @@ class MainActivity : AppCompatActivity() {
 
     private fun showVoicePicker() {
         val mgr = tts ?: run { toast("TTS chưa sẵn sàng"); return }
-        val locale = mgr.getCurrentLocale()
-        val voices = mgr.getVoicesForLocale(locale)
+        val items = mgr.getVoicesForLocale(mgr.getCurrentLocale())
 
-        if (voices.isEmpty()) {
-            toast("Không tìm thấy voice nào — hãy cài Google TTS")
+        if (items.isEmpty()) {
+            toast("Không tìm thấy voice — hãy cài Google TTS")
             return
         }
 
-        val current  = mgr.getCurrentVoice()
-        val labels   = voices.map { voiceDisplayName(it) }.toTypedArray()
-        val checkedIdx = voices.indexOfFirst { it.name == current?.name }.coerceAtLeast(0)
+        val current    = mgr.getCurrentVoice()
+        val checkedIdx = items.indexOfFirst { it.voice.name == current?.name }.coerceAtLeast(0)
+        val labels     = items.map { item ->
+            val base = voiceDisplayName(item.voice)
+            val tag  = when (item.status) {
+                TtsManager.VoiceStatus.LOCAL         -> ""
+                TtsManager.VoiceStatus.NETWORK       -> "  🌐"
+                TtsManager.VoiceStatus.NOT_INSTALLED -> "  ⬇️"
+            }
+            base + tag
+        }.toTypedArray()
 
         MaterialAlertDialogBuilder(this)
             .setTitle("🎤 Chọn giọng đọc")
+            .setMessage("✓ Offline  🌐 Cần mạng  ⬇️ Chưa tải")
             .setSingleChoiceItems(labels, checkedIdx) { dialog, which ->
-                mgr.setVoice(voices[which])
-                updateVoiceLabel()
-                dialog.dismiss()
-                toast("Đã chọn: ${voiceDisplayName(voices[which])}")
+                val item = items[which]
+                if (item.status == TtsManager.VoiceStatus.NOT_INSTALLED) {
+                    dialog.dismiss()
+                    MaterialAlertDialogBuilder(this)
+                        .setTitle("⬇️ Voice chưa tải")
+                        .setMessage(
+                            "\"${voiceDisplayName(item.voice)}\" chưa được tải về.\n\n" +
+                            "Mở cài đặt TTS để tải thêm giọng đọc (thường có cả giọng nam lẫn giọng nữ)?"
+                        )
+                        .setPositiveButton("Mở cài đặt TTS") { _, _ ->
+                            try {
+                                startActivity(
+                                    android.content.Intent(
+                                        android.speech.tts.TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA
+                                    )
+                                )
+                            } catch (_: Exception) {
+                                toast("Không thể mở cài đặt TTS")
+                            }
+                        }
+                        .setNegativeButton("Hủy", null)
+                        .show()
+                } else {
+                    mgr.setVoice(item.voice)
+                    updateVoiceLabel()
+                    dialog.dismiss()
+                    val tag = if (item.status == TtsManager.VoiceStatus.NETWORK) " (online)" else ""
+                    toast("Đã chọn: ${voiceDisplayName(item.voice)}$tag")
+                }
             }
-            .setNegativeButton("Hủy", null)
+            .setNegativeButton("Đóng", null)
             .show()
     }
 
     /** Formats a TTS Voice into a human-readable label. */
     private fun voiceDisplayName(voice: android.speech.tts.Voice): String {
         val name = voice.name
-        // Google TTS naming: "vi-vn-x-vif-local" → "f" suffix = female
+        // Google TTS naming convention: segment ending with "f" = female (e.g. "vif", "tpf")
         val isFemale = name.matches(Regex(".*[a-z]f-(?:local|network)$")) ||
                        name.contains("female", ignoreCase = true)
-        val gender  = if (isFemale) "♀" else "♂"
+        val gender  = if (isFemale) "♀ Nữ" else "♂ Nam"
         val quality = when {
-            voice.quality >= 400 -> "Rất cao"
-            voice.quality >= 300 -> "Cao"
+            voice.quality >= 400 -> "★★ Rất cao"
+            voice.quality >= 300 -> "★ Cao"
             voice.quality >= 200 -> "Thường"
             else                 -> "Thấp"
         }
