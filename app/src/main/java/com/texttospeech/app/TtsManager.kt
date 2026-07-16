@@ -25,6 +25,8 @@ class TtsManager(private val context: Context) {
 
     interface Listener {
         fun onInitialized()                                           = Unit
+        /** Fired just before the first chunk is sent to the TTS engine. */
+        fun onPlaybackStarted()                                       = Unit
         fun onProgress(current: Int, total: Int, percentage: Int)   = Unit
         fun onChunkStart(text: String, index: Int)                   = Unit
         fun onFinished()                                              = Unit
@@ -165,6 +167,7 @@ class TtsManager(private val context: Context) {
         isPlaying = true
         isPaused  = false
         activeSpeakingLocale = null   // force locale application on first chunk
+        eachListener { onPlaybackStarted() }
         speakChunk(currentChunkIndex)
     }
 
@@ -180,6 +183,7 @@ class TtsManager(private val context: Context) {
         isPaused  = false
         isPlaying = true
         activeSpeakingLocale = null   // force locale re-application after pause
+        eachListener { onPlaybackStarted() }
         speakChunk(currentChunkIndex)
     }
 
