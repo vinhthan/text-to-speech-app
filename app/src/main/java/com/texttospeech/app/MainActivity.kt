@@ -110,6 +110,7 @@ class MainActivity : AppCompatActivity() {
         setupToolbar()
         setupLanguageSpinner()
         setupTextArea()
+        setupTextScrollHandle()
         setupFileControls()
         setupSpeedControls()
         setupPlaybackButtons()
@@ -290,8 +291,66 @@ class MainActivity : AppCompatActivity() {
                     else             -> getColor(R.color.text_secondary)
                 }
                 binding.tvCharCount.setTextColor(color)
+                // Recompute scroll handle visibility when content changes
+                binding.etContent.post { syncScrollHandle() }
             }
         })
+    }
+
+    // ─── Text fast-scroller ───────────────────────────────────────────────────
+
+    /**
+     * Sets up the custom draggable scroll handle next to the EditText.
+     * Dragging the handle calls [EditText.scrollTo]; scrolling the EditText
+     * normally keeps the handle in sync via [ViewTreeObserver].
+     */
+    private fun setupTextScrollHandle() {
+        val et     = binding.etContent
+        val handle = binding.scrollHandle
+        val area   = binding.scrollArea
+
+        var dragStartRawY    = 0f
+        var dragStartScrollY = 0
+
+        handle.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    dragStartRawY    = event.rawY
+                    dragStartScrollY = et.scrollY
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val trackH    = area.height - handle.height
+                    val maxScroll = (et.layout?.height ?: 0) - et.height
+                    if (trackH <= 0 || maxScroll <= 0) return@setOnTouchListener true
+                    val dy        = event.rawY - dragStartRawY
+                    val newScroll = (dragStartScrollY + (dy / trackH * maxScroll).toInt())
+                        .coerceIn(0, maxScroll)
+                    et.scrollTo(0, newScroll)
+                    true
+                }
+                else -> true
+            }
+        }
+
+        // Keep handle position in sync when user scrolls the text normally
+        et.viewTreeObserver.addOnScrollChangedListener { syncScrollHandle() }
+    }
+
+    private fun syncScrollHandle() {
+        val et     = binding.etContent
+        val handle = binding.scrollHandle
+        val area   = binding.scrollArea
+
+        val maxScroll = (et.layout?.height ?: 0) - et.height
+        if (maxScroll <= 0) {
+            handle.visibility = View.INVISIBLE
+            return
+        }
+        handle.visibility = View.VISIBLE
+        val trackH  = (area.height - handle.height).coerceAtLeast(1)
+        val handleY = (et.scrollY.toFloat() / maxScroll * trackH).coerceIn(0f, trackH.toFloat())
+        handle.translationY = handleY
     }
 
     // ─── File controls ───────────────────────────────────────────────────────

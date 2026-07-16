@@ -146,28 +146,62 @@
                         android:textSize="14sp"
                         android:paddingBottom="8dp" />
 
-                    <!-- The EditText has a fixed height so it scrolls internally -->
-                    <com.google.android.material.textfield.TextInputLayout
+                    <!-- Text area + custom draggable scroll handle on the right -->
+                    <androidx.constraintlayout.widget.ConstraintLayout
                         android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        style="@style/Widget.Material3.TextInputLayout.OutlinedBox">
+                        android:layout_height="wrap_content">
 
-                        <com.google.android.material.textfield.TextInputEditText
-                            android:id="@+id/etContent"
-                            android:layout_width="match_parent"
-                            android:layout_height="240dp"
-                            android:gravity="top|start"
-                            android:hint="Paste nội dung vào đây hoặc mở file bên dưới…"
-                            android:inputType="textMultiLine"
-                            android:scrollbars="vertical"
-                            android:fadeScrollbars="false"
-                            android:scrollbarSize="6dp"
-                            android:scrollbarStyle="insideOverlay"
-                            android:overScrollMode="always"
-                            android:textSize="15sp"
-                            android:lineSpacingMultiplier="1.4" />
+                        <com.google.android.material.textfield.TextInputLayout
+                            android:id="@+id/tilContent"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+                            app:layout_constraintStart_toStartOf="parent"
+                            app:layout_constraintEnd_toStartOf="@+id/scrollArea"
+                            app:layout_constraintTop_toTopOf="parent">
 
-                    </com.google.android.material.textfield.TextInputLayout>
+                            <com.google.android.material.textfield.TextInputEditText
+                                android:id="@+id/etContent"
+                                android:layout_width="match_parent"
+                                android:layout_height="240dp"
+                                android:gravity="top|start"
+                                android:hint="Paste nội dung vào đây hoặc mở file bên dưới…"
+                                android:inputType="textMultiLine"
+                                android:scrollbars="none"
+                                android:overScrollMode="always"
+                                android:textSize="15sp"
+                                android:lineSpacingMultiplier="1.4" />
+
+                        </com.google.android.material.textfield.TextInputLayout>
+
+                        <!-- Scroll control: track background + draggable handle -->
+                        <FrameLayout
+                            android:id="@+id/scrollArea"
+                            android:layout_width="32dp"
+                            android:layout_height="0dp"
+                            android:layout_marginStart="6dp"
+                            app:layout_constraintTop_toTopOf="@id/tilContent"
+                            app:layout_constraintBottom_toBottomOf="@id/tilContent"
+                            app:layout_constraintEnd_toEndOf="parent">
+
+                            <!-- Track (always visible background) -->
+                            <View
+                                android:layout_width="match_parent"
+                                android:layout_height="match_parent"
+                                android:background="@drawable/scroll_track_shape" />
+
+                            <!-- Draggable handle — 60 dp tall, easy to grab -->
+                            <View
+                                android:id="@+id/scrollHandle"
+                                android:layout_width="match_parent"
+                                android:layout_height="60dp"
+                                android:background="@drawable/scroll_handle_shape"
+                                android:backgroundTint="?attr/colorPrimary"
+                                android:visibility="invisible" />
+
+                        </FrameLayout>
+
+                    </androidx.constraintlayout.widget.ConstraintLayout>
 
                     <TextView
                         android:id="@+id/tvCharCount"
