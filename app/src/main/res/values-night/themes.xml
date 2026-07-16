@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- Dark Theme -->
+    <style name="Theme.TextToSpeech" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- Primary brand -->
+        <item name="colorPrimary">@color/dark_primary</item>
+        <item name="colorOnPrimary">@color/dark_background</item>
+        <item name="colorPrimaryContainer">@color/dark_primary_variant</item>
+        <item name="colorOnPrimaryContainer">@color/dark_primary</item>
+
+        <!-- Background & Surface -->
+        <item name="android:colorBackground">@color/dark_background</item>
+        <item name="colorSurface">@color/dark_surface</item>
+        <item name="colorSurfaceVariant">@color/dark_surface_variant</item>
+        <item name="colorOnSurface">@color/dark_on_surface</item>
+        <item name="colorOnSurfaceVariant">#AAAAAA</item>
+
+        <!-- Error -->
+        <item name="colorError">#CF6679</item>
+
+        <!-- Window -->
+        <item name="android:windowBackground">@color/dark_background</item>
+        <item name="android:statusBarColor">@color/dark_surface</item>
+        <item name="android:navigationBarColor">@color/dark_background</item>
+    </style>
+
+</resources>

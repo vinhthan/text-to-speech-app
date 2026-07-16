@@ -1,0 +1,76 @@
+name: Build & Release APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle 8.4
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.4'
+
+      - name: Generate Gradle Wrapper
+        run: gradle wrapper --gradle-version=8.4
+
+      - name: Grant execute permission to gradlew
+        run: chmod +x gradlew
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --stacktrace
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
+
+      - name: Rename APK
+        run: |
+          mkdir -p release
+          cp app/build/outputs/apk/debug/app-debug.apk release/TextToSpeech-v${{ github.run_number }}.apk
+
+      - name: Upload APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TextToSpeech-debug-v${{ github.run_number }}
+          path: release/*.apk
+          retention-days: 30
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: "TextToSpeech v${{ github.run_number }}"
+          body: |
+            ## 🔊 Text to Speech Android App — Debug Build
+
+            ### Cách cài đặt trên điện thoại:
+            1. **Tải file** `TextToSpeech-v${{ github.run_number }}.apk` bên dưới (mục Assets)
+            2. Trên điện thoại: vào **Cài đặt → Bảo mật → Bật "Nguồn không xác định"**
+               (hoặc Android 8+: khi mở APK sẽ hỏi, chọn "Cho phép")
+            3. Mở file APK vừa tải → nhấn **Cài đặt**
+            4. Yêu cầu: Android 7.0+ và **Google Text-to-Speech** (hầu hết đã có sẵn)
+
+            ### Tính năng:
+            - 🇻🇳🇺🇸 Đọc tiếng Việt & tiếng Anh (tự nhận diện)
+            - 📂 Mở file TXT, PDF, DOCX, ODT, RTF
+            - ⚡ Điều chỉnh tốc độ 0.1x – 4.0x (±0.1x mỗi bước)
+            - 🔖 Bookmark vị trí đọc
+            - 📋 Lịch sử file đã đọc
+            - 🌙 Dark mode / Light mode
+          files: release/*.apk
+          draft: false
+          prerelease: false
