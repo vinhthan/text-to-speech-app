@@ -1,9 +1,14 @@
 package com.texttospeech.app
 
 import android.content.ClipboardManager
+import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.MotionEvent
@@ -26,7 +31,6 @@ import java.util.Locale
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
-    private lateinit var tts: TtsManager
     private lateinit var bookmarks: BookmarkManager
     private lateinit var history: HistoryManager
     private lateinit var historyAdapter: HistoryAdapter
@@ -34,13 +38,57 @@ class MainActivity : AppCompatActivity() {
     private var currentFileName = "Văn bản thủ công"
     private var isDark = false
 
-    // ─── File picker ────────────────────────────────────────────────────────
+    // ─── Service binding ─────────────────────────────────────────────────────
+
+    private var ttsService: TtsService? = null
+    private var bound = false
+
+    /** Shortcut to the TtsManager owned by the service. */
+    private val tts get() = ttsService?.ttsManager
+
+    private val serviceConn = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            ttsService = (binder as TtsService.TtsBinder).getService()
+            bound = true
+            ttsService?.setActivityListener(activityListener)
+            // Sync UI with the current service / TTS state
+            val mgr = tts ?: return
+            if (mgr.isInitialized) binding.btnPlay.isEnabled = true
+            setPlaybackUi(playing = mgr.isPlaying, paused = mgr.isPaused)
+            updateSpeedDisplay()
+        }
+        override fun onServiceDisconnected(name: ComponentName?) {
+            bound = false
+            ttsService = null
+        }
+    }
+
+    /** UI-update callbacks — TTS callbacks come from a background thread. */
+    private val activityListener = object : TtsManager.Listener {
+        override fun onInitialized() = runOnUiThread {
+            binding.btnPlay.isEnabled = true
+            toast("Text-to-Speech sẵn sàng")
+        }
+        override fun onProgress(current: Int, total: Int, percentage: Int) = runOnUiThread {
+            binding.progressBar.progress = percentage
+            binding.tvProgress.text = "Đoạn $current / $total"
+        }
+        override fun onChunkStart(text: String, index: Int) = Unit
+        override fun onFinished() = runOnUiThread {
+            setPlaybackUi(playing = false, paused = false)
+            binding.tvProgress.text = "Đã đọc xong ✓"
+            binding.progressBar.progress = 100
+        }
+        override fun onError(message: String) = runOnUiThread { toast(message) }
+    }
+
+    // ─── File picker ─────────────────────────────────────────────────────────
 
     private val filePicker = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri -> uri?.let { loadFile(it) } }
 
-    // ─── Lifecycle ──────────────────────────────────────────────────────────
+    // ─── Lifecycle ───────────────────────────────────────────────────────────
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -50,7 +98,6 @@ class MainActivity : AppCompatActivity() {
         bookmarks = BookmarkManager(this)
         history   = HistoryManager(this)
 
-        setupTts()
         setupToolbar()
         setupLanguageSpinner()
         setupTextArea()
@@ -61,42 +108,32 @@ class MainActivity : AppCompatActivity() {
         updateSpeedDisplay()
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        tts.release()
+    override fun onStart() {
+        super.onStart()
+        ensureServiceStarted()
+        bindService(Intent(this, TtsService::class.java), serviceConn, Context.BIND_AUTO_CREATE)
     }
 
-    // ─── TTS setup ──────────────────────────────────────────────────────────
-
-    private fun setupTts() {
-        tts = TtsManager(
-            context       = this,
-            onInitialized = {
-                runOnUiThread {
-                    binding.btnPlay.isEnabled = true
-                    toast("Text-to-Speech sẵn sàng")
-                }
-            },
-            onProgress    = { cur, total, pct ->
-                runOnUiThread {
-                    binding.progressBar.progress = pct
-                    binding.tvProgress.text = "Đoạn $cur / $total"
-                }
-            },
-            onChunkStart  = { _, _ -> /* could highlight text here */ },
-            onFinished    = {
-                runOnUiThread {
-                    setPlaybackUi(playing = false, paused = false)
-                    binding.tvProgress.text = "Đã đọc xong ✓"
-                    binding.progressBar.progress = 100
-                }
-            },
-            onError       = { msg -> runOnUiThread { toast(msg) } }
-        )
-        tts.init()
+    override fun onStop() {
+        super.onStop()
+        if (bound) {
+            ttsService?.setActivityListener(null)
+            unbindService(serviceConn)
+            bound = false
+            ttsService = null
+        }
     }
 
-    // ─── Toolbar ────────────────────────────────────────────────────────────
+    private fun ensureServiceStarted() {
+        val intent = Intent(this, TtsService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+    }
+
+    // ─── Toolbar ─────────────────────────────────────────────────────────────
 
     private fun setupToolbar() {
         setSupportActionBar(binding.toolbar)
@@ -110,7 +147,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ─── Language ───────────────────────────────────────────────────────────
+    // ─── Language ────────────────────────────────────────────────────────────
 
     private fun setupLanguageSpinner() {
         val langs = arrayOf("🇻🇳 Tiếng Việt", "🇺🇸 English", "🌐 Tự động nhận diện")
@@ -125,7 +162,7 @@ class MainActivity : AppCompatActivity() {
                     1    -> Locale.ENGLISH
                     else -> detectLocale()
                 }
-                tts.setLanguage(locale)
+                tts?.setLanguage(locale)
             }
             override fun onNothingSelected(p: AdapterView<*>?) {}
         }
@@ -137,10 +174,10 @@ class MainActivity : AppCompatActivity() {
         return if (text.lowercase().any { it in viChars }) Locale("vi", "VN") else Locale.ENGLISH
     }
 
-    // ─── Text area ──────────────────────────────────────────────────────────
+    // ─── Text area ───────────────────────────────────────────────────────────
 
     private fun setupTextArea() {
-        // Prevent NestedScrollView from intercepting scroll inside EditText
+        // Prevent NestedScrollView from stealing scroll events inside the EditText
         binding.etContent.setOnTouchListener { v, event ->
             v.parent.requestDisallowInterceptTouchEvent(true)
             if ((event.action and MotionEvent.ACTION_MASK) == MotionEvent.ACTION_UP) {
@@ -165,7 +202,7 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    // ─── File controls ──────────────────────────────────────────────────────
+    // ─── File controls ───────────────────────────────────────────────────────
 
     private fun setupFileControls() {
         binding.btnOpenFile.setOnClickListener {
@@ -201,7 +238,7 @@ class MainActivity : AppCompatActivity() {
                 .setPositiveButton("Xóa") { _, _ ->
                     binding.etContent.setText("")
                     currentFileName = "Văn bản thủ công"
-                    tts.stop()
+                    tts?.stop()
                     setPlaybackUi(playing = false, paused = false)
                     binding.progressBar.progress = 0
                     binding.tvProgress.text = "Sẵn sàng"
@@ -229,68 +266,66 @@ class MainActivity : AppCompatActivity() {
                     toast("Đã tải: $currentFileName (${"%,d".format(text.length)} ký tự)")
                     history.add(currentFileName, text, uri.toString())
                 }
-                .onFailure { err ->
-                    toast(err.message ?: "Lỗi không xác định")
-                }
+                .onFailure { err -> toast(err.message ?: "Lỗi không xác định") }
         }
     }
 
-    // ─── Speed controls ─────────────────────────────────────────────────────
+    // ─── Speed controls ──────────────────────────────────────────────────────
 
     private fun setupSpeedControls() {
         binding.btnSpeedDown.setOnClickListener {
-            val newRate = (tts.getSpeechRate() - 0.1f).coerceAtLeast(TtsManager.MIN_SPEED)
-            tts.setSpeed(newRate)
+            val mgr = tts ?: return@setOnClickListener
+            mgr.setSpeed((mgr.getSpeechRate() - 0.1f).coerceAtLeast(TtsManager.MIN_SPEED))
             updateSpeedDisplay()
         }
         binding.btnSpeedUp.setOnClickListener {
-            val newRate = (tts.getSpeechRate() + 0.1f).coerceAtMost(TtsManager.MAX_SPEED)
-            tts.setSpeed(newRate)
+            val mgr = tts ?: return@setOnClickListener
+            mgr.setSpeed((mgr.getSpeechRate() + 0.1f).coerceAtMost(TtsManager.MAX_SPEED))
             updateSpeedDisplay()
         }
         binding.btnSpeedReset.setOnClickListener {
-            tts.setSpeed(TtsManager.DEFAULT_SPEED)
+            tts?.setSpeed(TtsManager.DEFAULT_SPEED)
             updateSpeedDisplay()
         }
     }
 
     private fun updateSpeedDisplay() {
-        binding.tvSpeed.text = "%.1fx".format(tts.getSpeechRate())
+        binding.tvSpeed.text = "%.1fx".format(tts?.getSpeechRate() ?: TtsManager.DEFAULT_SPEED)
     }
 
-    // ─── Playback buttons ───────────────────────────────────────────────────
+    // ─── Playback buttons ────────────────────────────────────────────────────
 
     private fun setupPlaybackButtons() {
         binding.btnPlay.setOnClickListener {
-            val text = binding.etContent.text?.toString()?.trim() ?: ""
-            if (text.isBlank()) { toast("Vui lòng nhập nội dung"); return@setOnClickListener }
+            val raw = binding.etContent.text?.toString()?.trim() ?: ""
+            if (raw.isBlank()) { toast("Vui lòng nhập nội dung"); return@setOnClickListener }
+            val mgr = tts ?: return@setOnClickListener
 
-            if (tts.isPaused) {
-                tts.resume()
-                setPlaybackUi(playing = true, paused = false)
-            } else if (!tts.isPlaying) {
-                currentFileName.let { history.add(it, text) }
-                tts.setText(text)
-                tts.play()
-                setPlaybackUi(playing = true, paused = false)
-            }
-        }
-
-        binding.btnPause.setOnClickListener {
             when {
-                tts.isPlaying -> {
-                    tts.pause()
-                    setPlaybackUi(playing = false, paused = true)
+                mgr.isPaused -> {
+                    mgr.resume()
+                    setPlaybackUi(playing = true, paused = false)
                 }
-                tts.isPaused -> {
-                    tts.resume()
+                !mgr.isPlaying -> {
+                    history.add(currentFileName, raw)
+                    val normalized = TextNormalizer.normalize(raw, mgr.getCurrentLocale())
+                    mgr.setText(normalized)
+                    mgr.play()
                     setPlaybackUi(playing = true, paused = false)
                 }
             }
         }
 
+        binding.btnPause.setOnClickListener {
+            val mgr = tts ?: return@setOnClickListener
+            when {
+                mgr.isPlaying -> { mgr.pause();  setPlaybackUi(playing = false, paused = true) }
+                mgr.isPaused  -> { mgr.resume(); setPlaybackUi(playing = true,  paused = false) }
+            }
+        }
+
         binding.btnStop.setOnClickListener {
-            tts.stop()
+            tts?.stop()
             setPlaybackUi(playing = false, paused = false)
             binding.progressBar.progress = 0
             binding.tvProgress.text = "Sẵn sàng"
@@ -300,7 +335,7 @@ class MainActivity : AppCompatActivity() {
     private fun setPlaybackUi(playing: Boolean, paused: Boolean) {
         binding.btnPlay.apply {
             isEnabled = !playing
-            text = if (paused) "▶ Tiếp tục" else "▶ PHÁT"
+            text = if (paused) "▶ Tiếp tục" else "▶  PHÁT"
         }
         binding.btnPause.apply {
             isEnabled = playing || paused
@@ -309,7 +344,7 @@ class MainActivity : AppCompatActivity() {
         binding.btnStop.isEnabled = playing || paused
     }
 
-    // ─── Utility buttons (Bookmark / History) ───────────────────────────────
+    // ─── Utility buttons (Bookmark / History) ────────────────────────────────
 
     private fun setupUtilButtons() {
         binding.btnBookmark.setOnClickListener { showBookmarkMenu() }
@@ -319,22 +354,22 @@ class MainActivity : AppCompatActivity() {
     private fun showBookmarkMenu() {
         val text = binding.etContent.text?.toString() ?: ""
         if (text.isBlank()) { toast("Không có nội dung để bookmark"); return }
+        val chunkIdx = tts?.getCurrentChunkIndex() ?: 0
 
         MaterialAlertDialogBuilder(this)
             .setTitle("🔖 Bookmark")
             .setItems(arrayOf(
-                "➕ Lưu vị trí hiện tại (đoạn ${tts.getCurrentChunkIndex() + 1})",
+                "➕ Lưu vị trí hiện tại (đoạn ${chunkIdx + 1})",
                 "📋 Xem danh sách bookmark"
             )) { _, which ->
                 when (which) {
                     0 -> {
-                        val idx = tts.getCurrentChunkIndex()
                         bookmarks.add(
-                            label      = "Đoạn ${idx + 1} — $currentFileName",
-                            chunkIndex = idx,
+                            label      = "Đoạn ${chunkIdx + 1} — $currentFileName",
+                            chunkIndex = chunkIdx,
                             preview    = text.take(80)
                         )
-                        toast("Đã lưu bookmark tại đoạn ${idx + 1}")
+                        toast("Đã lưu bookmark tại đoạn ${chunkIdx + 1}")
                     }
                     1 -> showBookmarkList()
                 }
@@ -350,7 +385,7 @@ class MainActivity : AppCompatActivity() {
             .setTitle("Danh sách Bookmark")
             .setItems(labels) { _, idx ->
                 val bm = list[idx]
-                tts.seekToChunk(bm.chunkIndex)
+                tts?.seekToChunk(bm.chunkIndex)
                 toast("Đã chuyển đến: ${bm.label}")
             }
             .setNeutralButton("Xóa tất cả") { _, _ ->
@@ -365,18 +400,13 @@ class MainActivity : AppCompatActivity() {
         val list = history.getAll()
         if (list.isEmpty()) { toast("Chưa có lịch sử"); return }
 
-        // Build RecyclerView-based bottom sheet dialog
         val dialogView = layoutInflater.inflate(R.layout.dialog_history, null)
         val rv = dialogView.findViewById<androidx.recyclerview.widget.RecyclerView>(R.id.rvHistory)
         historyAdapter = HistoryAdapter(
             onClick = { item ->
-                // If has URI, reload the file; otherwise show info
                 if (item.uriString.isNotBlank()) {
-                    try {
-                        loadFile(Uri.parse(item.uriString))
-                    } catch (_: Exception) {
-                        toast("Không thể mở lại file (có thể đã bị di chuyển)")
-                    }
+                    try { loadFile(Uri.parse(item.uriString)) }
+                    catch (_: Exception) { toast("Không thể mở lại file (có thể đã bị di chuyển)") }
                 } else {
                     toast("Không có đường dẫn file để mở lại")
                 }
@@ -402,8 +432,7 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    // ─── Helpers ────────────────────────────────────────────────────────────
+    // ─── Helpers ─────────────────────────────────────────────────────────────
 
-    private fun toast(msg: String) =
-        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 }
