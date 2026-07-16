@@ -312,14 +312,17 @@ class MainActivity : AppCompatActivity() {
         var dragStartRawY    = 0f
         var dragStartScrollY = 0
 
-        handle.setOnTouchListener { _, event ->
-            when (event.action) {
+        handle.setOnTouchListener { v, event ->
+            when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
+                    // Prevent NestedScrollView from intercepting the drag gesture
+                    v.parent?.requestDisallowInterceptTouchEvent(true)
                     dragStartRawY    = event.rawY
                     dragStartScrollY = et.scrollY
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
+                    v.parent?.requestDisallowInterceptTouchEvent(true)
                     val trackH    = area.height - handle.height
                     val maxScroll = (et.layout?.height ?: 0) - et.height
                     if (trackH <= 0 || maxScroll <= 0) return@setOnTouchListener true
@@ -329,7 +332,11 @@ class MainActivity : AppCompatActivity() {
                     et.scrollTo(0, newScroll)
                     true
                 }
-                else -> true
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    v.parent?.requestDisallowInterceptTouchEvent(false)
+                    true
+                }
+                else -> false
             }
         }
 

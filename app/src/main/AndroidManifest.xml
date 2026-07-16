@@ -10,6 +10,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
 
+    <!-- Keep CPU awake while TTS is playing (prevents audio dropout when screen off) -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <!-- Show notification controls (Android 13+) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 

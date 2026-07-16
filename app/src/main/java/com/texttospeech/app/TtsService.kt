@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.media.app.NotificationCompat as MediaNotificationCompat
 
@@ -30,7 +31,15 @@ class TtsService : Service() {
 
     private val binder = TtsBinder()
 
-    override fun onBind(intent: Intent?): IBinder = binder
+    override fun onBind(intent: Intent?): IBinder {
+        isBound = true
+        return binder
+    }
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        isBound = false
+        return false  // don't call onRebind
+    }
 
     // ─── Constants ───────────────────────────────────────────────────────────
 
@@ -48,11 +57,22 @@ class TtsService : Service() {
 
     private var activityListener: TtsManager.Listener? = null
 
+    /** True while the Activity is bound — used to decide whether to auto-stop after finishing. */
+    private var isBound = false
+
+    /**
+     * PARTIAL_WAKE_LOCK keeps the CPU awake while TTS is playing so the audio
+     * pipeline is not interrupted when the screen turns off.
+     */
+    private var wakeLock: PowerManager.WakeLock? = null
+
     // ─── Lifecycle ───────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
         createChannel()
+        wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TextToSpeech:playback")
         ttsManager = TtsManager(this)
         ttsManager.addListener(serviceListener)
         ttsManager.init()
@@ -89,6 +109,7 @@ class TtsService : Service() {
     }
 
     override fun onDestroy() {
+        releaseWakeLock()
         ttsManager.release()
         super.onDestroy()
     }
@@ -112,14 +133,26 @@ class TtsService : Service() {
             updateNotification("Sẵn sàng đọc", isPlaying = false)
         }
         override fun onProgress(current: Int, total: Int, percentage: Int) {
+            // Acquire wake lock the first time playback starts (timeout = 3 hours)
+            if (wakeLock?.isHeld == false) {
+                wakeLock?.acquire(3 * 60 * 60 * 1000L)
+            }
             updateNotification("Đoạn $current / $total", isPlaying = true)
         }
         override fun onFinished() {
+            releaseWakeLock()
             updateNotification("Đã đọc xong ✓", isPlaying = false)
+            // No Activity bound → the service is no longer needed; self-stop
+            if (!isBound) stopSelf()
         }
         override fun onError(message: String) {
+            releaseWakeLock()
             updateNotification("Lỗi: $message", isPlaying = false)
         }
+    }
+
+    private fun releaseWakeLock() {
+        if (wakeLock?.isHeld == true) wakeLock?.release()
     }
 
     // ─── Notification ────────────────────────────────────────────────────────
