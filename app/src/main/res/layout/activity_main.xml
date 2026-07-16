@@ -119,6 +119,17 @@
 
                     </LinearLayout>
 
+                    <!-- Row 3: download enhanced voices hint -->
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnDownloadVoice"
+                        style="@style/Widget.Material3.Button.TextButton"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:text="⬇️  Tải giọng đọc chất lượng cao hơn"
+                        android:textSize="12sp"
+                        android:gravity="start" />
+
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 

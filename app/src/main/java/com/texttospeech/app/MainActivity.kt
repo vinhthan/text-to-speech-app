@@ -9,6 +9,8 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.os.PowerManager
+import android.provider.Settings
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.MotionEvent
@@ -117,6 +119,7 @@ class MainActivity : AppCompatActivity() {
         setupSeekBar()
         setupUtilButtons()
         updateSpeedDisplay()
+        checkBatteryOptimization()
     }
 
     override fun onStart() {
@@ -180,6 +183,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.btnVoicePick.setOnClickListener { showVoicePicker() }
+
+        binding.btnDownloadVoice.setOnClickListener { openTtsVoiceDownload() }
     }
 
     private fun updateVoiceLabel() {
@@ -615,6 +620,84 @@ class MainActivity : AppCompatActivity() {
                 history.clear()
                 historyAdapter.submitList(emptyList())
                 toast("Đã xóa lịch sử")
+            }
+            .setNegativeButton("Đóng", null)
+            .show()
+    }
+
+    // ─── Battery optimisation ────────────────────────────────────────────────
+
+    /**
+     * If the app is still subject to battery optimisation, shows a one-time dialog
+     * asking the user to exempt it — this is the most reliable way to prevent Android
+     * (and OEM battery savers) from killing the TTS foreground service when the screen
+     * is off.  The dialog is shown at most once; the answer is persisted in prefs.
+     */
+    private fun checkBatteryOptimization() {
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) return   // already exempted
+
+        val prefs = getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("battery_opt_asked", false)) return      // already asked once
+
+        prefs.edit().putBoolean("battery_opt_asked", true).apply()
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle("⚡ Cho phép chạy nền liên tục")
+            .setMessage(
+                "Để TTS không bị dừng khi tắt màn hình hoặc chuyển sang app khác, " +
+                "hãy tắt tối ưu pin cho ứng dụng này.\n\n" +
+                "Nhấn \"Cho phép\" → hệ thống sẽ hỏi → chọn \"Không hạn chế\"."
+            )
+            .setPositiveButton("Cho phép") { _, _ ->
+                try {
+                    startActivity(
+                        Intent(
+                            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                            Uri.parse("package:$packageName")
+                        )
+                    )
+                } catch (_: Exception) {
+                    toast("Vào Cài đặt → Ứng dụng → Pin → Không hạn chế")
+                }
+            }
+            .setNegativeButton("Để sau", null)
+            .show()
+    }
+
+    // ─── Voice download ───────────────────────────────────────────────────────
+
+    /**
+     * Opens the Google TTS engine's built-in voice download screen so the user
+     * can install Enhanced (neural) voices — much better quality than the default
+     * standard voices, and completely free / offline after download.
+     */
+    private fun openTtsVoiceDownload() {
+        MaterialAlertDialogBuilder(this)
+            .setTitle("⬇️ Tải giọng đọc chất lượng cao")
+            .setMessage(
+                "Google TTS có giọng đọc nâng cao (Enhanced / Neural) tốt hơn nhiều " +
+                "so với giọng mặc định, và hoạt động hoàn toàn offline sau khi tải.\n\n" +
+                "Cách tải:\n" +
+                "1. Nhấn \"Mở cài đặt TTS\" bên dưới\n" +
+                "2. Chọn \"Google Text-to-Speech\" làm engine\n" +
+                "3. Nhấn ⚙️ bên cạnh → \"Tải ngôn ngữ\" → chọn Tiếng Việt hoặc English\n" +
+                "4. Tải bản \"Enhanced\" / \"Neural\" (thường 30–80 MB)\n" +
+                "5. Quay lại app → \"Chọn giọng\" để dùng giọng vừa tải"
+            )
+            .setPositiveButton("Mở cài đặt TTS") { _, _ ->
+                try {
+                    // Opens the TTS engine voice-download screen directly
+                    startActivity(
+                        Intent(android.speech.tts.TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)
+                    )
+                } catch (_: Exception) {
+                    try {
+                        startActivity(Intent("com.android.settings.TTS_SETTINGS"))
+                    } catch (_: Exception) {
+                        toast("Vào Cài đặt → Quản lý chung → TTS để tải giọng")
+                    }
+                }
             }
             .setNegativeButton("Đóng", null)
             .show()

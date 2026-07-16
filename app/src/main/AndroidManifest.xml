@@ -13,6 +13,9 @@
     <!-- Keep CPU awake while TTS is playing (prevents audio dropout when screen off) -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- Request exemption from battery optimisation / Doze so TTS never stops in background -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <!-- Show notification controls (Android 13+) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
