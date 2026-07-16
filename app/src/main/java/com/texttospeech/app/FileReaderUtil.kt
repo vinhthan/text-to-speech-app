@@ -61,20 +61,22 @@ object FileReaderUtil {
     // Works well for text-based PDFs. Scanned/image-only PDFs return empty text.
     // Handles both uncompressed and FlateDecode (zlib) compressed content streams.
 
-    private fun readPdf(context: Context, uri: Uri): Result<String> = try {
-        val bytes = context.contentResolver.openInputStream(uri)?.readBytes()
-            ?: return Result.success("")
-        val text = extractPdfText(bytes)
-        if (text.isBlank()) {
-            Result.failure(Exception(
-                "Không thể trích xuất văn bản từ PDF này.\n" +
-                "Thử mở trong Google Docs → Copy → Paste vào ô văn bản."
-            ))
-        } else {
-            Result.success(text)
+    private fun readPdf(context: Context, uri: Uri): Result<String> {
+        return try {
+            val bytes = context.contentResolver.openInputStream(uri)?.readBytes()
+                ?: return Result.success("")
+            val text = extractPdfText(bytes)
+            if (text.isBlank()) {
+                Result.failure(Exception(
+                    "Không thể trích xuất văn bản từ PDF này.\n" +
+                    "Thử mở trong Google Docs → Copy → Paste vào ô văn bản."
+                ))
+            } else {
+                Result.success(text)
+            }
+        } catch (e: Exception) {
+            Result.failure(Exception("Lỗi đọc PDF: ${e.message}"))
         }
-    } catch (e: Exception) {
-        Result.failure(Exception("Lỗi đọc PDF: ${e.message}"))
     }
 
     private fun extractPdfText(data: ByteArray): String {
