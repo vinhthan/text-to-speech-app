@@ -12,12 +12,16 @@ import java.util.Locale
  * Wraps Android TextToSpeech with:
  *  - Listener-based callbacks (multiple observers supported)
  *  - Sentence-level chunking — each sentence is its own TTS utterance
- *  - Explicit sequential triggering via mainHandler.post() in onDone —
- *    avoids calling speak() from inside a TTS binder callback thread,
- *    which is silently ignored on some OEM / Android-version combinations
+ *  - QUEUE_ADD bulk-queuing: all chunks are submitted to the TTS engine at
+ *    once so playback is entirely engine-driven and never relies on a
+ *    mainHandler.post() round-trip between chunks. This is the key fix for
+ *    background playback: Android throttles the app's main thread when it is
+ *    in the background, so the old speak→onDone→post→speak loop would stall.
+ *    With bulk-queuing the engine runs independently of our main thread.
  *  - speak() return-value check + error signal on failure
  *  - Best-voice auto-selection per locale (neural / enhanced preferred)
  *  - Auto-language mode — LanguageDetector labels each word-group VI / EN
+ *    (falls back to one-at-a-time because setLanguage() is not queued)
  */
 class TtsManager(private val context: Context) {
 
@@ -122,21 +126,24 @@ class TtsManager(private val context: Context) {
             }
 
             override fun onDone(utteranceId: String?) {
-                // Post to main thread — avoids calling speak() from within
-                // the TTS binder callback, which fails silently on many devices.
                 if (isPaused) return
                 val idx = parseIdx(utteranceId) ?: return
                 mainHandler.post {
                     if (isPaused || !isPlaying) return@post
                     if (idx >= chunks.size - 1) {
+                        // Last chunk finished → playback complete
                         isPlaying = false
                         currentChunkIndex = 0
                         eachListener { onFinished() }
-                    } else {
+                    } else if (autoLanguage) {
+                        // Auto-language mode: each chunk may need setLanguage() which is
+                        // NOT queued, so we must speak one chunk at a time.
                         val next = idx + 1
                         currentChunkIndex = next
                         speakChunk(next)
                     }
+                    // Single-locale mode: all chunks were already bulk-queued via
+                    // queueAllChunks(); the engine drives playback independently.
                 }
             }
 
@@ -175,7 +182,8 @@ class TtsManager(private val context: Context) {
         isPaused  = false
         activeSpeakingLocale = null
         eachListener { onPlaybackStarted() }
-        speakChunk(currentChunkIndex)
+        if (autoLanguage) speakChunk(currentChunkIndex)   // one-at-a-time for locale switching
+        else              queueAllChunks(currentChunkIndex) // bulk-queue for robust background play
     }
 
     fun pause() {
@@ -191,7 +199,8 @@ class TtsManager(private val context: Context) {
         isPlaying = true
         activeSpeakingLocale = null
         eachListener { onPlaybackStarted() }
-        speakChunk(currentChunkIndex)
+        if (autoLanguage) speakChunk(currentChunkIndex)
+        else              queueAllChunks(currentChunkIndex)
     }
 
     fun stop() {
@@ -211,7 +220,8 @@ class TtsManager(private val context: Context) {
             isPlaying = true
             isPaused  = false
             activeSpeakingLocale = null
-            speakChunk(currentChunkIndex)
+            if (autoLanguage) speakChunk(currentChunkIndex)
+            else              queueAllChunks(currentChunkIndex)
         }
     }
 
@@ -266,9 +276,36 @@ class TtsManager(private val context: Context) {
         }
         val result = tts?.speak(chunk.text, TextToSpeech.QUEUE_FLUSH, Bundle(), "chunk_$index")
         if (result == TextToSpeech.ERROR) {
-            // Engine rejected speak() — signal error so service can handle recovery
             isPlaying = false
             eachListener { onError("TTS engine lỗi — nhấn Phát để thử lại") }
+        }
+    }
+
+    /**
+     * Submits all chunks from [startIndex] to the end into the TTS engine queue
+     * using QUEUE_ADD. Once queued, the engine plays them sequentially with no
+     * involvement from our main thread between chunks — this is what makes
+     * background playback reliable. Android can throttle the app's main thread
+     * when in background; with QUEUE_ADD the engine is completely self-driving.
+     *
+     * Only used in single-locale mode. Auto-language falls back to speakChunk()
+     * because setLanguage() is not part of the TTS utterance queue.
+     */
+    private fun queueAllChunks(startIndex: Int) {
+        if (startIndex < 0 || startIndex >= chunks.size || !isInitialized) return
+        // Apply locale once for the whole batch (single-locale mode)
+        val locale = chunks[startIndex].locale
+        if (locale != activeSpeakingLocale) {
+            activeSpeakingLocale = applyLocale(locale)
+        }
+        for (i in startIndex until chunks.size) {
+            val mode = if (i == startIndex) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+            val result = tts?.speak(chunks[i].text, mode, Bundle(), "chunk_$i")
+            if (result == TextToSpeech.ERROR) {
+                isPlaying = false
+                eachListener { onError("TTS engine lỗi — nhấn Phát để thử lại") }
+                return
+            }
         }
     }
 
