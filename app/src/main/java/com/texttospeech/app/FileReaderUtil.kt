@@ -133,65 +133,104 @@ object FileReaderUtil {
 
     /**
      * Extract human-readable text from a PDF content stream.
-     * Handles: (text)Tj, [(text)]TJ, and newline operators.
+     *
+     * Operators handled (in document order via a single combined regex):
+     *   (text)Tj  — show string
+     *   [(a)(b)]TJ — kerned/array text
+     *   T* / Td / TD — move to next visual line → flush + newline
+     *
+     * Processing in document order is critical: the old code ran separate
+     * findAll passes for Tj and then TJ, losing their relative ordering and
+     * producing all Tj text before all TJ text on the same "line".
      */
     private fun extractTextOps(stream: String, out: StringBuilder) {
-        // BT...ET blocks contain text operators
-        val btEt = Regex("""BT\s+(.+?)\s+ET""", setOf(RegexOption.DOT_MATCHES_ALL))
+        // Each BT…ET block is one text object (may contain many visual lines)
+        val btEt = Regex("""BT\b([\s\S]+?)\bET\b""")
         btEt.findAll(stream).forEach { block ->
             val content = block.groupValues[1]
-            var addedInBlock = false
+            val line = StringBuilder()   // accumulates text for the current visual line
 
-            // (string)Tj — show string
-            Regex("""\(([^)\\]*(?:\\.[^)\\]*)*)\)\s*Tj""").findAll(content).forEach { m ->
-                val t = unescapePdfString(m.groupValues[1])
-                if (t.isNotBlank()) { out.append(t).append(' '); addedInBlock = true }
-            }
-
-            // [(str1) offset (str2)]TJ — kerned text
-            Regex("""\[([^\]]*)\]\s*TJ""").findAll(content).forEach { m ->
-                Regex("""\(([^)\\]*(?:\\.[^)\\]*)*)\)""").findAll(m.groupValues[1]).forEach { sm ->
-                    val t = unescapePdfString(sm.groupValues[1])
-                    if (t.isNotBlank()) { out.append(t); addedInBlock = true }
+            // Combined regex — matches operators in document order
+            val opRe = Regex(
+                """\(([^)\\]*(?:\\.[^)\\]*)*)\)\s*Tj""" +   // alt1 (text)Tj  → group 1
+                """|\[([^\]]*)\]\s*TJ""" +                    // alt2 [arr]TJ   → group 2
+                """|(T\*|Td|TD)"""                            // alt3 line-move → group 3
+            )
+            opRe.findAll(content).forEach { m ->
+                when {
+                    m.groupValues[3].isNotEmpty() -> {
+                        // Line-positioning operator → flush current line
+                        val s = line.toString().trim()
+                        if (s.isNotBlank()) out.append(s).append('\n')
+                        line.clear()
+                    }
+                    m.groupValues[2].isNotEmpty() -> {
+                        // [(array)]TJ — kerned text; extract each string piece
+                        Regex("""\(([^)\\]*(?:\\.[^)\\]*)*)\)""")
+                            .findAll(m.groupValues[2])
+                            .forEach { sm -> line.append(unescapePdfString(sm.groupValues[1])) }
+                    }
+                    else -> {
+                        // (string)Tj
+                        val t = unescapePdfString(m.groupValues[1])
+                        if (t.isNotBlank()) line.append(t).append(' ')
+                    }
                 }
-                out.append(' ')
             }
-
-            // T* / Td / TD — move to next line
-            if (content.contains("T*") || content.contains(" Td") || content.contains(" TD")) {
-                if (addedInBlock) out.append('\n')
-            }
+            // Flush any remaining text in the block
+            val s = line.toString().trim()
+            if (s.isNotBlank()) out.append(s).append('\n')
         }
     }
 
-    /** Convert PDF string escape sequences to real characters. */
+    /**
+     * Convert PDF string escape sequences to real characters.
+     *
+     * Handles:
+     *  - Standard PDF escape sequences (\n \r \t \( \) \\ \nnn octal)
+     *  - UTF-16BE BOM (0xFE 0xFF) — the dominant encoding for Vietnamese,
+     *    Chinese, Japanese and any PDF generated from Word / Google Docs.
+     *    Without this, each Vietnamese character's high byte (often < 32)
+     *    was silently discarded, leaving only ASCII chars (a "few lines").
+     */
     private fun unescapePdfString(s: String): String {
-        val sb = StringBuilder()
+        // Collect raw byte values (0–255) after resolving escape sequences
+        val raw = ArrayList<Int>(s.length)
         var i = 0
         while (i < s.length) {
             if (s[i] == '\\' && i + 1 < s.length) {
                 when {
-                    s[i + 1] == 'n'  -> { sb.append('\n'); i += 2 }
-                    s[i + 1] == 'r'  -> { sb.append('\r'); i += 2 }
-                    s[i + 1] == 't'  -> { sb.append('\t'); i += 2 }
-                    s[i + 1] == '('  -> { sb.append('(');  i += 2 }
-                    s[i + 1] == ')'  -> { sb.append(')');  i += 2 }
-                    s[i + 1] == '\\' -> { sb.append('\\'); i += 2 }
+                    s[i+1] == 'n'  -> { raw.add('\n'.code); i += 2 }
+                    s[i+1] == 'r'  -> { raw.add('\r'.code); i += 2 }
+                    s[i+1] == 't'  -> { raw.add('\t'.code); i += 2 }
+                    s[i+1] == '('  -> { raw.add('('.code);  i += 2 }
+                    s[i+1] == ')'  -> { raw.add(')'.code);  i += 2 }
+                    s[i+1] == '\\' -> { raw.add('\\'.code); i += 2 }
                     i + 3 < s.length &&
                     s[i+1].isDigit() && s[i+2].isDigit() && s[i+3].isDigit() -> {
-                        val code = s.substring(i + 1, i + 4).toIntOrNull(8) ?: 0
-                        if (code in 32..126 || code > 160) sb.append(code.toChar())
+                        raw.add(s.substring(i+1, i+4).toIntOrNull(8) ?: 0)
                         i += 4
                     }
-                    else -> { sb.append(s[i + 1]); i += 2 }
+                    else -> { raw.add(s[i+1].code and 0xFF); i += 2 }
                 }
             } else {
-                val c = s[i]
-                if (c.code >= 32) sb.append(c)
+                raw.add(s[i].code and 0xFF)
                 i++
             }
         }
-        return sb.toString()
+        if (raw.isEmpty()) return ""
+
+        // Detect UTF-16BE BOM: 0xFE 0xFF — used by Vietnamese / CJK PDFs
+        if (raw.size >= 2 && raw[0] == 0xFE && raw[1] == 0xFF) {
+            val bytes = ByteArray(raw.size - 2) { raw[it + 2].toByte() }
+            return try { String(bytes, Charsets.UTF_16BE) } catch (_: Exception) { "" }
+        }
+
+        // Plain ISO-8859-1 / WinAnsi: keep printable characters
+        return raw
+            .filter { it >= 32 || it == 10 || it == 13 || it == 9 }
+            .map { it.toChar() }
+            .joinToString("")
     }
 
     // ─── DOCX (Office Open XML — ZIP + XML) ─────────────────────────────────

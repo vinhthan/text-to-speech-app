@@ -61,6 +61,12 @@ class MainActivity : AppCompatActivity() {
             if (mgr.isInitialized) binding.btnPlay.isEnabled = true
             setPlaybackUi(playing = mgr.isPlaying, paused = mgr.isPaused)
             updateSpeedDisplay()
+            // Re-apply the spinner's current language selection now that the
+            // service is bound.  When the service is already running (re-open
+            // app), the spinner fires onItemSelected in onCreate() while tts
+            // is still null — this call ensures the language is actually set.
+            applySpinnerLanguage(binding.spinnerLang.selectedItemPosition)
+            updateVoiceLabel()
         }
         override fun onServiceDisconnected(name: ComponentName?) {
             bound = false
@@ -177,12 +183,7 @@ class MainActivity : AppCompatActivity() {
 
         binding.spinnerLang.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
-                val mgr = tts ?: return
-                when (pos) {
-                    0    -> { mgr.setAutoLanguage(false); mgr.setLanguage(Locale("vi", "VN")) }
-                    1    -> { mgr.setAutoLanguage(false); mgr.setLanguage(Locale.ENGLISH) }
-                    else -> { mgr.setAutoLanguage(true) }
-                }
+                applySpinnerLanguage(pos)
                 updateVoiceLabel()
             }
             override fun onNothingSelected(p: AdapterView<*>?) {}
@@ -191,6 +192,23 @@ class MainActivity : AppCompatActivity() {
         binding.btnVoicePick.setOnClickListener { showVoicePicker() }
 
         binding.btnDownloadVoice.setOnClickListener { openTtsVoiceDownload() }
+    }
+
+    /**
+     * Applies the language/auto-mode selection to TtsManager.
+     * Called both from the spinner's onItemSelected AND from onServiceConnected —
+     * because when the service is already running (re-open app), the spinner fires
+     * during onCreate() before the service is bound (tts == null at that point),
+     * so the language would silently not be set. Calling this again once the
+     * service is connected ensures the spinner's current selection is honoured.
+     */
+    private fun applySpinnerLanguage(pos: Int) {
+        val mgr = tts ?: return
+        when (pos) {
+            0    -> { mgr.setAutoLanguage(false); mgr.setLanguage(Locale("vi", "VN")) }
+            1    -> { mgr.setAutoLanguage(false); mgr.setLanguage(Locale.ENGLISH) }
+            else -> { mgr.setAutoLanguage(true) }
+        }
     }
 
     private fun updateVoiceLabel() {
