@@ -77,6 +77,15 @@ class TtsService : Service() {
     // Wake lock
     private var wakeLock: PowerManager.WakeLock? = null
 
+    /**
+     * True as soon as the user starts or resumes playback, false only when
+     * playback fully finishes, the user stops, or an unrecoverable error occurs.
+     * Used to keep the foreground notification [setOngoing] even while paused —
+     * a non-ongoing notification signals to OEM battery managers that the
+     * service is idle and can be killed.
+     */
+    private var sessionActive = false
+
     // Audio focus ─────────────────────────────────────────────────────────────
     private var audioFocusRequest: AudioFocusRequest? = null   // API 26+
     private var hasAudioFocus    = false
@@ -181,6 +190,7 @@ class TtsService : Service() {
                 }
             }
             ACTION_STOP -> {
+                sessionActive = false
                 ttsManager.stop()
                 abandonAudioFocus()
                 clearSavedState()
@@ -230,6 +240,7 @@ class TtsService : Service() {
         }
 
         override fun onPlaybackStarted() {
+            sessionActive = true
             requestAudioFocus()
             if (wakeLock?.isHeld == false) {
                 wakeLock?.acquire(3 * 60 * 60 * 1000L)   // 3-hour safety cap
@@ -238,6 +249,7 @@ class TtsService : Service() {
             saveTextFile(ttsManager.getRawText())
             saveChunk(ttsManager.getCurrentChunkIndex(), playing = true)
             updateSessionState(PlaybackStateCompat.STATE_PLAYING)
+            updateNotification("Đang phát…", isPlaying = true)
         }
 
         override fun onProgress(current: Int, total: Int, percentage: Int) {
@@ -247,6 +259,7 @@ class TtsService : Service() {
         }
 
         override fun onFinished() {
+            sessionActive = false
             releaseWakeLock()
             abandonAudioFocus()
             clearSavedState()
@@ -256,6 +269,7 @@ class TtsService : Service() {
         }
 
         override fun onError(message: String) {
+            sessionActive = false
             releaseWakeLock()
             abandonAudioFocus()
             clearSavedState()
@@ -279,6 +293,7 @@ class TtsService : Service() {
                     updateNotification("Tạm dừng", isPlaying = false)
                 }
                 override fun onStop() {
+                    sessionActive = false
                     ttsManager.stop()
                     abandonAudioFocus()
                     clearSavedState()
@@ -410,7 +425,7 @@ class TtsService : Service() {
             .setContentTitle("🔊 Text to Speech")
             .setContentText(status)
             .setContentIntent(openPi)
-            .setOngoing(isPlaying)
+            .setOngoing(sessionActive)   // ongoing = true even when paused → keeps process priority high
             .setSilent(true)
             .addAction(
                 if (isPlaying) android.R.drawable.ic_media_pause

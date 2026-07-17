@@ -40,10 +40,13 @@
             </intent-filter>
         </activity>
 
-        <!-- Foreground service for continuous background TTS playback -->
+        <!-- Foreground service for continuous background TTS playback.
+             stopWithTask="false" → service keeps running even when the user
+             swipes the app away from Recent Apps (same behaviour as music apps). -->
         <service
             android:name=".TtsService"
             android:foregroundServiceType="mediaPlayback"
+            android:stopWithTask="false"
             android:exported="false" />
 
     </application>

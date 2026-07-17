@@ -125,7 +125,13 @@ class MainActivity : AppCompatActivity() {
     override fun onStart() {
         super.onStart()
         ensureServiceStarted()
-        bindService(Intent(this, TtsService::class.java), serviceConn, Context.BIND_AUTO_CREATE)
+        // BIND_IMPORTANT: while this Activity is in foreground, the service is treated
+        // with foreground-app priority — OEM battery managers are less likely to kill it.
+        bindService(
+            Intent(this, TtsService::class.java),
+            serviceConn,
+            Context.BIND_AUTO_CREATE or Context.BIND_IMPORTANT
+        )
     }
 
     override fun onStop() {
@@ -464,14 +470,6 @@ class MainActivity : AppCompatActivity() {
             if (raw.isBlank()) { toast("Vui lòng nhập nội dung"); return@setOnClickListener }
             val mgr = tts ?: return@setOnClickListener
 
-            // Remind user to grant battery optimisation exemption every time
-            // they start playback while it's still not granted — it's the most
-            // critical permission for uninterrupted background TTS.
-            val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-                toast("⚠️ Chưa tắt tối ưu pin — TTS có thể bị dừng khi thoát app")
-            }
-
             when {
                 mgr.isPaused -> {
                     mgr.resume()
@@ -636,28 +634,29 @@ class MainActivity : AppCompatActivity() {
     // ─── Battery optimisation ────────────────────────────────────────────────
 
     /**
-     * If the app is still subject to battery optimisation, shows a one-time dialog
-     * asking the user to exempt it — this is the most reliable way to prevent Android
-     * (and OEM battery savers) from killing the TTS foreground service when the screen
-     * is off.  The dialog is shown at most once; the answer is persisted in prefs.
+     * Shows a dialog every fresh app launch until the user grants battery-optimisation
+     * exemption.  Without this, OEM battery managers (Samsung, Xiaomi, OPPO, Vivo …)
+     * can kill the foreground service seconds after the user leaves the app, regardless
+     * of wake locks, audio focus, or MediaSession.
+     *
+     * Once granted ([PowerManager.isIgnoringBatteryOptimizations] returns true) this
+     * function becomes a no-op — the dialog is never shown again.
      */
     private fun checkBatteryOptimization() {
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        if (pm.isIgnoringBatteryOptimizations(packageName)) return   // already exempted
+        if (pm.isIgnoringBatteryOptimizations(packageName)) return   // already exempted — done
 
-        val prefs = getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
-        if (prefs.getBoolean("battery_opt_asked", false)) return      // already asked once
-
-        prefs.edit().putBoolean("battery_opt_asked", true).apply()
-
+        // Not yet exempted: show every fresh launch so the user is not left wondering
+        // why TTS stops.  No SharedPreferences gate — the check above is the gate.
         MaterialAlertDialogBuilder(this)
-            .setTitle("⚡ Cho phép chạy nền liên tục")
+            .setTitle("⚡ Bắt buộc: Cho phép chạy nền")
             .setMessage(
-                "Để TTS không bị dừng khi tắt màn hình hoặc chuyển sang app khác, " +
-                "hãy tắt tối ưu pin cho ứng dụng này.\n\n" +
-                "Nhấn \"Cho phép\" → hệ thống sẽ hỏi → chọn \"Không hạn chế\"."
+                "Để TTS đọc liên tục khi thoát app hoặc tắt màn hình, " +
+                "bạn PHẢI tắt tối ưu hóa pin cho ứng dụng này.\n\n" +
+                "Nhấn \"Cấp quyền ngay\" → chọn \"Không hạn chế\" (Unrestricted).\n\n" +
+                "Dialog này sẽ không hiện lại sau khi bạn cấp quyền."
             )
-            .setPositiveButton("Cho phép") { _, _ ->
+            .setPositiveButton("Cấp quyền ngay") { _, _ ->
                 try {
                     startActivity(
                         Intent(
@@ -669,7 +668,7 @@ class MainActivity : AppCompatActivity() {
                     toast("Vào Cài đặt → Ứng dụng → Pin → Không hạn chế")
                 }
             }
-            .setNegativeButton("Để sau", null)
+            .setNegativeButton("Bỏ qua", null)
             .show()
     }
 
