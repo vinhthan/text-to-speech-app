@@ -99,28 +99,29 @@ class TtsService : Service() {
     private val onAudioFocusChange = AudioManager.OnAudioFocusChangeListener { focus ->
         when (focus) {
             AudioManager.AUDIOFOCUS_LOSS -> {
-                // Permanent loss — pause but do NOT auto-resume later
+                // Permanent loss (e.g. incoming phone call).
+                // Pause and auto-resume when focus returns (call ends).
                 if (ttsManager.isPlaying) {
                     ttsManager.pause()
                     updateNotification("Tạm dừng", isPlaying = false)
+                    pausedByFocusLoss = true   // will auto-resume on AUDIOFOCUS_GAIN
                 }
                 hasAudioFocus = false
-                pausedByFocusLoss = false   // permanent loss, not transient
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                // Transient loss (notification, phone call start, etc.)
-                // Pause and mark so we auto-resume when focus returns
-                if (ttsManager.isPlaying) {
-                    ttsManager.pause()
-                    updateNotification("Tạm dừng", isPlaying = false)
-                    pausedByFocusLoss = true
-                }
+                // Transient loss: notification sounds, OEM launcher animations,
+                // navigation prompts, etc.
+                // Do NOT pause TTS — brief system sounds must not interrupt reading.
+                // Root-cause of "stops when going to home screen": some OEM launchers
+                // (Samsung, Xiaomi…) request transient audio focus on activation;
+                // our old code paused here and AUDIOFOCUS_GAIN never fired in the
+                // background, leaving TTS permanently stuck in the paused state.
                 hasAudioFocus = false
             }
             AudioManager.AUDIOFOCUS_GAIN -> {
                 hasAudioFocus = true
-                // Auto-resume ONLY if we paused because of a transient loss
+                // Auto-resume if we paused due to a permanent focus loss (e.g. call ended)
                 if (pausedByFocusLoss && ttsManager.isPaused) {
                     pausedByFocusLoss = false
                     ttsManager.resume()   // onPlaybackStarted fires → re-requests focus
