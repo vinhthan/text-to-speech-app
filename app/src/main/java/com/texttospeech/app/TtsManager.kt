@@ -241,9 +241,14 @@ class TtsManager(private val context: Context) {
 
     fun getVoicesForLocale(locale: Locale): List<VoiceItem> {
         val notInstalledKey = TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED
-        return tts?.voices
-            ?.filter { v -> v.locale.language == locale.language }
-            ?.map { v ->
+        val allVoices = tts?.voices ?: return emptyList()
+
+        // Try progressively looser locale matching so OEM TTS engines are covered
+        val matched = allVoices.filter { v -> voiceMatchesLocale(v, locale) }
+            .ifEmpty { allVoices.toList() }   // fallback: show ALL voices if nothing matched
+
+        return matched
+            .map { v ->
                 val status = when {
                     v.features.contains(notInstalledKey) -> VoiceStatus.NOT_INSTALLED
                     v.isNetworkConnectionRequired        -> VoiceStatus.NETWORK
@@ -251,11 +256,10 @@ class TtsManager(private val context: Context) {
                 }
                 VoiceItem(v, status)
             }
-            ?.sortedWith(
+            .sortedWith(
                 compareBy<VoiceItem> { it.status.ordinal }
                     .thenByDescending { it.voice.quality }
             )
-            ?: emptyList()
     }
 
     fun getCurrentVoice(): android.speech.tts.Voice? = tts?.voice
@@ -324,19 +328,44 @@ class TtsManager(private val context: Context) {
         }
     }
 
+    /**
+     * Checks whether a Voice matches the target locale using multiple strategies.
+     * This is necessary because OEM TTS engines (Samsung, Xiaomi, MIUI…) may
+     * represent locale differently (e.g. "vi" vs "vi-VN" vs "vie").
+     */
+    private fun voiceMatchesLocale(v: android.speech.tts.Voice, locale: Locale): Boolean {
+        val lang = locale.language
+        return v.locale.language == lang ||
+               v.locale.toLanguageTag().startsWith(lang) ||
+               v.locale.toString().startsWith(lang)
+    }
+
     private fun selectBestVoice(locale: Locale) {
         val engine = tts ?: return
-        val key    = locale.language
-        val voice = bestVoiceCache.getOrPut(key) {
-            engine.voices
-                ?.filter { v ->
-                    v.locale.language == key &&
-                    !v.isNetworkConnectionRequired &&
-                    !v.features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
-                }
-                ?.maxByOrNull { it.quality }
+        val key = locale.language
+
+        // Only use cached value if it is non-null; don't permanently cache null
+        // (voices list may be empty during early TTS init on some OEM engines).
+        val cached = bestVoiceCache[key]
+        if (cached != null) {
+            engine.voice = cached
+            return
         }
-        voice?.let { engine.voice = it }
+
+        val found = engine.voices
+            ?.filter { v ->
+                voiceMatchesLocale(v, locale) &&
+                !v.isNetworkConnectionRequired &&
+                !v.features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
+            }
+            ?.maxByOrNull { it.quality }
+
+        if (found != null) {
+            bestVoiceCache[key] = found
+            engine.voice = found
+        }
+        // If still null (engine not ready yet), leave engine.voice unchanged
+        // and do NOT store null so the next call will retry.
     }
 
     // ─── Chunking ────────────────────────────────────────────────────────────

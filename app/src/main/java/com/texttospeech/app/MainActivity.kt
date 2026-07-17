@@ -293,7 +293,9 @@ class MainActivity : AppCompatActivity() {
             else                 -> "Thấp"
         }
         val shortName = name.removeSuffix("-local").removeSuffix("-network")
-        return "$shortName  $gender  [$quality]"
+        // Show language so voices are identifiable when picker shows multiple languages
+        val lang = voice.locale.getDisplayLanguage(Locale("vi", "VN"))
+        return "$shortName  ($lang)  $gender  [$quality]"
     }
 
     // ─── Text area ───────────────────────────────────────────────────────────
