@@ -164,8 +164,14 @@ class ModelManager(private val context: Context) {
                 HttpURLConnection.HTTP_MOVED_TEMP,
                 307, 308 -> {
                     val loc = conn.getHeaderField("Location")
+                        ?: throw Exception("Redirect without Location header")
                     conn.disconnect()
-                    current = loc ?: throw Exception("Redirect without Location header")
+                    // Resolve relative redirects (e.g. HuggingFace returns "/api/resolve-cache/...")
+                    current = if (loc.startsWith("http://") || loc.startsWith("https://")) {
+                        loc
+                    } else {
+                        URL(URL(current), loc).toString()
+                    }
                     return@repeat   // continue loop
                 }
                 else -> throw Exception("HTTP ${conn.responseCode} for $current")
