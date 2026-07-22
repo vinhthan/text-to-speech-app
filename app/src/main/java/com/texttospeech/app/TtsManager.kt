@@ -6,6 +6,14 @@ import android.os.Handler
 import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Locale
 
 /**
@@ -47,10 +55,11 @@ class TtsManager(private val context: Context) {
     // ─── Constants ───────────────────────────────────────────────────────────
 
     companion object {
-        const val MAX_CHUNK_SIZE = 3000
-        const val MIN_SPEED      = 0.1f
-        const val MAX_SPEED      = 4.0f
-        const val DEFAULT_SPEED  = 1.0f
+        const val MAX_CHUNK_SIZE   = 3000
+        const val PIPER_CHUNK_SIZE = 500    // Piper is slower; smaller chunks reduce latency
+        const val MIN_SPEED        = 0.1f
+        const val MAX_SPEED        = 4.0f
+        const val DEFAULT_SPEED    = 1.0f
     }
 
     // ─── Voice metadata ───────────────────────────────────────────────────────
@@ -96,6 +105,22 @@ class TtsManager(private val context: Context) {
 
     private var activeSpeakingLocale: Locale? = null
     private val bestVoiceCache = mutableMapOf<String, android.speech.tts.Voice?>()
+
+    // ─── Piper TTS (offline neural) ──────────────────────────────────────────
+
+    private var piperEngine: PiperTtsEngine? = null
+    private var piperJob: Job? = null
+    private val piperScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    fun enablePiper(engine: PiperTtsEngine) { piperEngine = engine }
+
+    fun disablePiper() {
+        piperJob?.cancel()
+        piperEngine?.stop()
+        piperEngine = null
+    }
+
+    fun isPiperEnabled() = piperEngine != null
 
     // ─── Initialisation ──────────────────────────────────────────────────────
 
@@ -176,21 +201,29 @@ class TtsManager(private val context: Context) {
     // ─── Playback control ────────────────────────────────────────────────────
 
     fun play() {
-        if (!isInitialized) { eachListener { onError("TTS chưa sẵn sàng.") }; return }
         if (chunks.isEmpty()) { eachListener { onError("Chưa có nội dung để đọc.") }; return }
         isPlaying = true
         isPaused  = false
         activeSpeakingLocale = null
         eachListener { onPlaybackStarted() }
-        if (autoLanguage) speakChunk(currentChunkIndex)   // one-at-a-time for locale switching
-        else              queueAllChunks(currentChunkIndex) // bulk-queue for robust background play
+        if (piperEngine != null) {
+            playWithPiper(currentChunkIndex)
+        } else {
+            if (!isInitialized) { eachListener { onError("TTS chưa sẵn sàng.") }; return }
+            if (autoLanguage) speakChunk(currentChunkIndex)   // one-at-a-time for locale switching
+            else              queueAllChunks(currentChunkIndex) // bulk-queue for robust background play
+        }
     }
 
     fun pause() {
         if (!isPlaying) return
         isPaused  = true
         isPlaying = false
-        tts?.stop()
+        if (piperEngine != null) {
+            piperEngine!!.stop()          // interrupt current AudioTrack playback
+        } else {
+            tts?.stop()
+        }
     }
 
     fun resume() {
@@ -199,13 +232,22 @@ class TtsManager(private val context: Context) {
         isPlaying = true
         activeSpeakingLocale = null
         eachListener { onPlaybackStarted() }
-        if (autoLanguage) speakChunk(currentChunkIndex)
-        else              queueAllChunks(currentChunkIndex)
+        if (piperEngine != null) {
+            playWithPiper(currentChunkIndex)
+        } else {
+            if (autoLanguage) speakChunk(currentChunkIndex)
+            else              queueAllChunks(currentChunkIndex)
+        }
     }
 
     fun stop() {
-        mainHandler.removeCallbacksAndMessages(null)   // cancel any pending speakChunk posts
-        tts?.stop()
+        if (piperEngine != null) {
+            piperJob?.cancel()
+            piperEngine!!.stop()
+        } else {
+            mainHandler.removeCallbacksAndMessages(null)   // cancel any pending speakChunk posts
+            tts?.stop()
+        }
         isPlaying         = false
         isPaused          = false
         currentChunkIndex = 0
@@ -213,15 +255,25 @@ class TtsManager(private val context: Context) {
 
     fun seekToChunk(index: Int) {
         val wasPlaying = isPlaying
-        mainHandler.removeCallbacksAndMessages(null)
-        tts?.stop()
+        if (piperEngine != null) {
+            piperJob?.cancel()
+            piperEngine!!.stop()
+        } else {
+            mainHandler.removeCallbacksAndMessages(null)
+            tts?.stop()
+        }
         currentChunkIndex = index.coerceIn(0, (chunks.size - 1).coerceAtLeast(0))
         if (wasPlaying) {
             isPlaying = true
             isPaused  = false
             activeSpeakingLocale = null
-            if (autoLanguage) speakChunk(currentChunkIndex)
-            else              queueAllChunks(currentChunkIndex)
+            if (piperEngine != null) {
+                playWithPiper(currentChunkIndex)
+            } else if (autoLanguage) {
+                speakChunk(currentChunkIndex)
+            } else {
+                queueAllChunks(currentChunkIndex)
+            }
         }
     }
 
@@ -313,6 +365,69 @@ class TtsManager(private val context: Context) {
         }
     }
 
+    /**
+     * Piper TTS playback loop with synthesis–playback pipeline.
+     *
+     * Two concurrent coroutines:
+     *  - **Synthesis** (Default dispatcher): converts text → FloatArray via OfflineTts.
+     *    Sends results through a Channel with capacity=1 so the next chunk is
+     *    pre-synthesised while the current one is playing (latency hiding).
+     *  - **Playback** (IO dispatcher): writes FloatArray → AudioTrack, blocks until done.
+     *
+     * Stopping: [piperEngine.stop] sets a volatile flag that breaks out of the
+     * AudioTrack polling loop; checking [isPlaying] between chunks is the gate
+     * for pause / stop triggered from outside.
+     */
+    private fun playWithPiper(startIndex: Int) {
+        piperJob?.cancel()
+        piperJob = piperScope.launch {
+            val engine     = piperEngine ?: return@launch
+            val sampleRate = engine.sampleRate
+
+            // Channel buffers 1 synthesized chunk so playback never waits for synthesis
+            val channel = Channel<Pair<Int, FloatArray>>(capacity = 1)
+
+            // ── Synthesis producer ──────────────────────────────────────────
+            val synthesisJob = launch(Dispatchers.Default) {
+                for (i in startIndex until chunks.size) {
+                    if (!isActive || !isPlaying) break
+                    val audio = engine.synthesize(chunks[i].text, speechRate) ?: break
+                    channel.send(Pair(i, audio.samples))
+                }
+                channel.close()
+            }
+
+            // ── Playback consumer ───────────────────────────────────────────
+            for ((idx, samples) in channel) {
+                if (!isPlaying) break
+
+                withContext(Dispatchers.Main) {
+                    eachListener { onChunkStart(chunks.getOrElse(idx) { Chunk("", currentLocale) }.text, idx) }
+                }
+
+                val audio = GeneratedAudio(samples, sampleRate)
+                val completed = engine.playBlocking(audio)
+
+                if (!completed || !isPlaying) break   // stopped or paused
+
+                currentChunkIndex = idx + 1
+                val pct = ((idx + 1) * 100) / chunks.size.coerceAtLeast(1)
+                withContext(Dispatchers.Main) {
+                    eachListener { onProgress(idx + 1, chunks.size, pct) }
+                }
+            }
+
+            synthesisJob.cancel()
+
+            // Notify finished only if we played all chunks naturally
+            if (isActive && isPlaying && currentChunkIndex >= chunks.size) {
+                isPlaying         = false
+                currentChunkIndex = 0
+                withContext(Dispatchers.Main) { eachListener { onFinished() } }
+            }
+        }
+    }
+
     private fun parseIdx(id: String?) = id?.removePrefix("chunk_")?.toIntOrNull()
 
     private fun applyLocale(locale: Locale): Locale {
@@ -380,12 +495,13 @@ class TtsManager(private val context: Context) {
     }
 
     private fun buildMonolingualChunks(text: String, locale: Locale): List<Chunk> {
-        val result = mutableListOf<Chunk>()
+        val maxSize = if (piperEngine != null) PIPER_CHUNK_SIZE else MAX_CHUNK_SIZE
+        val result  = mutableListOf<Chunk>()
         for (sent in splitSentences(text)) {
             val s = sent.trim()
             if (s.isBlank()) continue
-            if (s.length > MAX_CHUNK_SIZE) {
-                splitByWords(s).forEach { result += Chunk(it, locale) }
+            if (s.length > maxSize) {
+                splitByWords(s, maxSize).forEach { result += Chunk(it, locale) }
             } else {
                 result += Chunk(s, locale)
             }
@@ -402,11 +518,11 @@ class TtsManager(private val context: Context) {
             .filter { it.isNotBlank() }
     }
 
-    private fun splitByWords(text: String): List<String> {
+    private fun splitByWords(text: String, maxSize: Int = MAX_CHUNK_SIZE): List<String> {
         val result = mutableListOf<String>()
         val buf    = StringBuilder()
         for (word in text.split(' ')) {
-            if (buf.length + word.length + 1 > MAX_CHUNK_SIZE && buf.isNotBlank()) {
+            if (buf.length + word.length + 1 > maxSize && buf.isNotBlank()) {
                 result += buf.toString().trim()
                 buf.clear()
             }
@@ -420,6 +536,9 @@ class TtsManager(private val context: Context) {
     // ─── Lifecycle ───────────────────────────────────────────────────────────
 
     fun release() {
+        piperJob?.cancel()
+        piperEngine?.release()
+        piperEngine = null
         mainHandler.removeCallbacksAndMessages(null)
         tts?.stop()
         tts?.shutdown()

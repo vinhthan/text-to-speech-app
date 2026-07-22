@@ -39,6 +39,7 @@ class TtsService : Service() {
 
     inner class TtsBinder : Binder() {
         fun getService(): TtsService = this@TtsService
+        fun getModelManager(): ModelManager = modelManager
     }
 
     private val binder = TtsBinder()
@@ -71,6 +72,9 @@ class TtsService : Service() {
     lateinit var ttsManager: TtsManager
         private set
 
+    val modelManager by lazy { ModelManager(this) }
+
+    private var piperEngine: PiperTtsEngine? = null
     private var activityListener: TtsManager.Listener? = null
     private var isBound = false
 
@@ -221,6 +225,34 @@ class TtsService : Service() {
         activityListener = listener
         listener?.let { ttsManager.addListener(it) }
     }
+
+    // ─── Piper TTS engine management ─────────────────────────────────────────
+
+    /**
+     * Initializes and enables the Piper offline TTS engine.
+     * Must be called from a background thread (model loading is blocking).
+     * @return true on success
+     */
+    fun enablePiperTts(): Boolean {
+        val engine = PiperTtsEngine()
+        val ok = engine.init(modelManager.modelDir)
+        if (ok) {
+            piperEngine?.release()
+            piperEngine = engine
+            ttsManager.enablePiper(engine)
+        } else {
+            engine.release()
+        }
+        return ok
+    }
+
+    fun disablePiperTts() {
+        ttsManager.disablePiper()
+        piperEngine?.release()
+        piperEngine = null
+    }
+
+    fun isPiperEnabled() = ttsManager.isPiperEnabled()
 
     // ─── Service-side TTS listener ────────────────────────────────────────────
 

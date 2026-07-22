@@ -52,6 +52,10 @@ android {
                 'META-INF/LGPL2.1'
             ]
         }
+        // Keep native .so files uncompressed for faster loading (API 23+)
+        jniLibs {
+            useLegacyPackaging false
+        }
     }
 }
 
@@ -75,4 +79,7 @@ dependencies {
 
     // MediaStyle notification (for lockscreen/notification playback controls)
     implementation 'androidx.media:media:1.7.0'
+
+    // sherpa-onnx native libs are added via jniLibs/ directory (no AAR needed)
+    // The Kotlin API (SherpaOnnxTts.kt) is included as a source file in this project.
 }

@@ -70,6 +70,12 @@ jobs:
           print("Launcher icons generated OK")
           PYEOF
 
+      - name: Verify sherpa-onnx native libs present
+        run: |
+          echo "Checking jniLibs..."
+          ls -lh app/src/main/jniLibs/arm64-v8a/ 2>/dev/null || echo "WARNING: arm64-v8a libs missing"
+          ls -lh app/src/main/jniLibs/armeabi-v7a/ 2>/dev/null || echo "WARNING: armeabi-v7a libs missing"
+
       - name: Build Debug APK
         run: ./gradlew assembleDebug --stacktrace
 
@@ -102,6 +108,7 @@ jobs:
             4. Yêu cầu: **Android 7.0+** và **Google Text-to-Speech** (hầu hết đã có sẵn)
 
             ### Tính năng:
+            - 🤖 **Piper AI (Offline Neural TTS)** — giọng đọc tiếng Việt truyền cảm, tải một lần ~63MB
             - 🇻🇳🇺🇸 Đọc tiếng Việt & tiếng Anh (tự nhận diện ngôn ngữ)
             - 📂 Mở file TXT, PDF (cơ bản), DOCX, ODT, RTF
             - ⚡ Điều chỉnh tốc độ 0.1x – 4.0x (bước ±0.1x)

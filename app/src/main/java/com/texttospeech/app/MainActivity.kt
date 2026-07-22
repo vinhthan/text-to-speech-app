@@ -1,5 +1,6 @@
 package com.texttospeech.app
 
+import android.app.AlertDialog
 import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
@@ -17,7 +18,9 @@ import android.view.MotionEvent
 import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
+import android.widget.ProgressBar
 import android.widget.SeekBar
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -43,6 +46,11 @@ class MainActivity : AppCompatActivity() {
     /** True while the user is dragging the seek bar — suppresses progress updates. */
     private var isSeeking = false
 
+    private val prefs by lazy { getSharedPreferences("tts_ui", Context.MODE_PRIVATE) }
+    private var usePiper: Boolean
+        get()      = prefs.getBoolean("use_piper", false)
+        set(value) = prefs.edit().putBoolean("use_piper", value).apply()
+
     // ─── Service binding ─────────────────────────────────────────────────────
 
     private var ttsService: TtsService? = null
@@ -67,6 +75,21 @@ class MainActivity : AppCompatActivity() {
             // is still null — this call ensures the language is actually set.
             applySpinnerLanguage(binding.spinnerLang.selectedItemPosition)
             updateVoiceLabel()
+            // Auto-enable Piper if user had previously selected it and model is ready
+            if (usePiper && !(ttsService?.isPiperEnabled() == true)) {
+                val svc = ttsService ?: return
+                if (svc.modelManager.isModelReady()) {
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        val ok = svc.enablePiperTts()
+                        withContext(Dispatchers.Main) {
+                            if (ok) updateVoiceLabel()
+                            else { usePiper = false; toast("Lỗi khởi động Piper TTS") }
+                        }
+                    }
+                } else {
+                    usePiper = false  // model was deleted externally
+                }
+            }
         }
         override fun onServiceDisconnected(name: ComponentName?) {
             bound = false
@@ -212,6 +235,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateVoiceLabel() {
+        if (ttsService?.isPiperEnabled() == true) {
+            binding.tvVoiceLabel.text = "🤖 Piper AI (Offline Neural)"
+            return
+        }
         val voice = tts?.getCurrentVoice()
         binding.tvVoiceLabel.text = if (voice != null) {
             "🎤 ${voiceDisplayName(voice)}"
@@ -221,17 +248,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showVoicePicker() {
+        val svc = ttsService ?: run { toast("TTS chưa sẵn sàng"); return }
         val mgr = tts ?: run { toast("TTS chưa sẵn sàng"); return }
-        val items = mgr.getVoicesForLocale(mgr.getCurrentLocale())
 
-        if (items.isEmpty()) {
-            toast("Không tìm thấy voice — hãy cài Google TTS")
-            return
+        val androidVoices = mgr.getVoicesForLocale(mgr.getCurrentLocale())
+
+        // Build label list: Piper option first, then Android voices
+        val isPiperReady   = svc.modelManager.isModelReady()
+        val isPiperActive  = svc.isPiperEnabled()
+
+        val piperLabel = buildString {
+            append("🤖 Piper AI (Offline Neural)")
+            if (isPiperActive) append(" ✓")
+            if (!isPiperReady) append("  [Cần tải ~63MB]")
         }
 
-        val current    = mgr.getCurrentVoice()
-        val checkedIdx = items.indexOfFirst { it.voice.name == current?.name }.coerceAtLeast(0)
-        val labels     = items.map { item ->
+        val androidLabels = androidVoices.map { item ->
             val base = voiceDisplayName(item.voice)
             val tag  = when (item.status) {
                 TtsManager.VoiceStatus.LOCAL         -> ""
@@ -239,44 +271,140 @@ class MainActivity : AppCompatActivity() {
                 TtsManager.VoiceStatus.NOT_INSTALLED -> "  ⬇️"
             }
             base + tag
-        }.toTypedArray()
+        }
+
+        val allLabels = (listOf(piperLabel) + androidLabels).toTypedArray()
+
+        // Current selection: 0 = Piper, 1..N = Android voices
+        val currentAndroidVoice = mgr.getCurrentVoice()
+        val androidChecked = androidVoices.indexOfFirst { it.voice.name == currentAndroidVoice?.name }
+        val checkedIdx = if (isPiperActive) 0 else if (androidChecked >= 0) androidChecked + 1 else 1
 
         MaterialAlertDialogBuilder(this)
             .setTitle("🎤 Chọn giọng đọc")
-            .setMessage("✓ Offline  🌐 Cần mạng  ⬇️ Chưa tải")
-            .setSingleChoiceItems(labels, checkedIdx) { dialog, which ->
-                val item = items[which]
-                if (item.status == TtsManager.VoiceStatus.NOT_INSTALLED) {
-                    dialog.dismiss()
-                    MaterialAlertDialogBuilder(this)
-                        .setTitle("⬇️ Voice chưa tải")
-                        .setMessage(
-                            "\"${voiceDisplayName(item.voice)}\" chưa được tải về.\n\n" +
-                            "Mở cài đặt TTS để tải thêm giọng đọc (thường có cả giọng nam lẫn giọng nữ)?"
-                        )
-                        .setPositiveButton("Mở cài đặt TTS") { _, _ ->
-                            try {
-                                startActivity(
-                                    android.content.Intent(
-                                        android.speech.tts.TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA
-                                    )
-                                )
-                            } catch (_: Exception) {
-                                toast("Không thể mở cài đặt TTS")
-                            }
-                        }
-                        .setNegativeButton("Hủy", null)
-                        .show()
+            .setMessage("🤖 AI Neural  |  ✓ Offline  🌐 Cần mạng  ⬇️ Chưa tải")
+            .setSingleChoiceItems(allLabels, checkedIdx) { dialog, which ->
+                dialog.dismiss()
+                if (which == 0) {
+                    // ── Piper AI selected ─────────────────────────────────
+                    if (!isPiperReady) {
+                        showPiperDownloadDialog(svc)
+                    } else {
+                        enablePiperEngine(svc)
+                    }
                 } else {
-                    mgr.setVoice(item.voice)
-                    updateVoiceLabel()
-                    dialog.dismiss()
-                    val tag = if (item.status == TtsManager.VoiceStatus.NETWORK) " (online)" else ""
-                    toast("Đã chọn: ${voiceDisplayName(item.voice)}$tag")
+                    // ── Android TTS voice selected ────────────────────────
+                    if (isPiperActive) {
+                        lifecycleScope.launch(Dispatchers.IO) {
+                            svc.disablePiperTts()
+                            withContext(Dispatchers.Main) { usePiper = false; updateVoiceLabel() }
+                        }
+                    }
+                    val item = androidVoices.getOrNull(which - 1) ?: return@setSingleChoiceItems
+                    if (item.status == TtsManager.VoiceStatus.NOT_INSTALLED) {
+                        MaterialAlertDialogBuilder(this)
+                            .setTitle("⬇️ Voice chưa tải")
+                            .setMessage(
+                                "\"${voiceDisplayName(item.voice)}\" chưa được tải về.\n\n" +
+                                "Mở cài đặt TTS để tải thêm giọng đọc?"
+                            )
+                            .setPositiveButton("Mở cài đặt TTS") { _, _ ->
+                                try {
+                                    startActivity(
+                                        android.content.Intent(
+                                            android.speech.tts.TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA
+                                        )
+                                    )
+                                } catch (_: Exception) {
+                                    toast("Không thể mở cài đặt TTS")
+                                }
+                            }
+                            .setNegativeButton("Hủy", null)
+                            .show()
+                    } else {
+                        mgr.setVoice(item.voice)
+                        updateVoiceLabel()
+                        val tag = if (item.status == TtsManager.VoiceStatus.NETWORK) " (online)" else ""
+                        toast("Đã chọn: ${voiceDisplayName(item.voice)}$tag")
+                    }
                 }
             }
             .setNegativeButton("Đóng", null)
             .show()
+    }
+
+    /** Shows download progress dialog and downloads the Piper model. */
+    private fun showPiperDownloadDialog(svc: TtsService) {
+        val dialogView = layoutInflater.inflate(android.R.layout.activity_list_item, null)
+        // Build a simple progress dialog manually (Material dialogs don't support ProgressBar natively)
+        val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max       = 100
+            progress  = 0
+            isIndeterminate = false
+        }
+        val tvStatus = TextView(this).apply {
+            text    = "Đang chuẩn bị..."
+            setPadding(48, 16, 48, 0)
+        }
+
+        val dialog = MaterialAlertDialogBuilder(this)
+            .setTitle("⬇️ Tải Piper AI Model (~63MB)")
+            .setMessage("Mô hình sẽ được lưu trong bộ nhớ app.\nChỉ cần tải một lần, sau đó hoạt động offline.")
+            .setView(android.widget.LinearLayout(this).apply {
+                orientation = android.widget.LinearLayout.VERTICAL
+                setPadding(48, 16, 48, 16)
+                addView(progressBar)
+                addView(tvStatus)
+            })
+            .setCancelable(false)
+            .setNegativeButton("Hủy") { dlg, _ ->
+                dlg.dismiss()
+                // Cleanup partial download
+                lifecycleScope.launch(Dispatchers.IO) { svc.modelManager.deleteModel() }
+            }
+            .show()
+
+        lifecycleScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    svc.modelManager.downloadModel { downloaded, total ->
+                        val pct = ((downloaded * 100) / total).toInt().coerceIn(0, 100)
+                        val mb  = downloaded / 1_000_000
+                        runOnUiThread {
+                            progressBar.progress = pct
+                            tvStatus.text = "Đã tải ${mb}MB / ~63MB  ($pct%)"
+                        }
+                    }
+                }
+                dialog.dismiss()
+                enablePiperEngine(svc)
+            } catch (e: Exception) {
+                dialog.dismiss()
+                withContext(Dispatchers.IO) { svc.modelManager.deleteModel() }
+                MaterialAlertDialogBuilder(this@MainActivity)
+                    .setTitle("⚠️ Tải thất bại")
+                    .setMessage("Kiểm tra kết nối internet và thử lại.\nLỗi: ${e.message}")
+                    .setPositiveButton("OK", null)
+                    .show()
+            }
+        }
+    }
+
+    /** Enables Piper engine in the background, updates UI on completion. */
+    private fun enablePiperEngine(svc: TtsService) {
+        toast("Đang khởi động Piper AI...")
+        lifecycleScope.launch(Dispatchers.IO) {
+            val ok = svc.enablePiperTts()
+            withContext(Dispatchers.Main) {
+                if (ok) {
+                    usePiper = true
+                    updateVoiceLabel()
+                    toast("Piper AI đã sẵn sàng!")
+                } else {
+                    toast("Lỗi khởi động Piper — thử tải lại model")
+                }
+            }
+        }
     }
 
     /** Formats a TTS Voice into a human-readable label. */
