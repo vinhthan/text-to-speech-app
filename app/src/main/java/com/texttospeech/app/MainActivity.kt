@@ -18,9 +18,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
-import android.widget.ProgressBar
 import android.widget.SeekBar
-import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -50,6 +48,9 @@ class MainActivity : AppCompatActivity() {
     private var usePiper: Boolean
         get()      = prefs.getBoolean("use_piper", false)
         set(value) = prefs.edit().putBoolean("use_piper", value).apply()
+
+    /** True while the Piper model is being downloaded in the background. */
+    @Volatile private var isPiperDownloading = false
 
     // ─── Service binding ─────────────────────────────────────────────────────
 
@@ -89,6 +90,14 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     usePiper = false  // model was deleted externally
                 }
+            }
+            // Auto-download Piper model on first launch (once, in background)
+            val svcForDownload = ttsService ?: return
+            if (!svcForDownload.modelManager.isModelReady()
+                && !isPiperDownloading
+                && !prefs.getBoolean("piper_download_attempted", false)
+            ) {
+                startPiperDownload(svcForDownload)
             }
         }
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -234,16 +243,22 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun updateVoiceLabel() {
-        if (ttsService?.isPiperEnabled() == true) {
-            binding.tvVoiceLabel.text = "🤖 Piper AI (Offline Neural)"
-            return
-        }
-        val voice = tts?.getCurrentVoice()
-        binding.tvVoiceLabel.text = if (voice != null) {
-            "🎤 ${voiceDisplayName(voice)}"
-        } else {
-            "🎤 Giọng đọc: Mặc định"
+    private fun updateVoiceLabel(downloadPct: Int = -1) {
+        when {
+            downloadPct in 0..99 ->
+                binding.tvVoiceLabel.text = "⬇️ Đang tải Piper AI ($downloadPct%)"
+            ttsService?.isPiperEnabled() == true ->
+                binding.tvVoiceLabel.text = "🤖 Piper AI (Offline Neural)"
+            isPiperDownloading ->
+                binding.tvVoiceLabel.text = "⬇️ Đang tải Piper AI..."
+            else -> {
+                val voice = tts?.getCurrentVoice()
+                binding.tvVoiceLabel.text = if (voice != null) {
+                    "🎤 ${voiceDisplayName(voice)}"
+                } else {
+                    "🎤 Giọng đọc: Mặc định"
+                }
+            }
         }
     }
 
@@ -260,7 +275,8 @@ class MainActivity : AppCompatActivity() {
         val piperLabel = buildString {
             append("🤖 Piper AI (Offline Neural)")
             if (isPiperActive) append(" ✓")
-            if (!isPiperReady) append("  [Cần tải ~63MB]")
+            if (isPiperDownloading) append("  [⬇️ Đang tải...]")
+            else if (!isPiperReady) append("  [Chưa tải ~63MB]")
         }
 
         val androidLabels = androidVoices.map { item ->
@@ -287,10 +303,11 @@ class MainActivity : AppCompatActivity() {
                 dialog.dismiss()
                 if (which == 0) {
                     // ── Piper AI selected ─────────────────────────────────
-                    if (!isPiperReady) {
-                        showPiperDownloadDialog(svc)
-                    } else {
-                        enablePiperEngine(svc)
+                    when {
+                        isPiperActive      -> { /* already active — nothing to do */ }
+                        isPiperDownloading -> toast("⬇️ Đang tải... vui lòng đợi")
+                        isPiperReady       -> enablePiperEngine(svc)
+                        else               -> startPiperDownload(svc)
                     }
                 } else {
                     // ── Android TTS voice selected ────────────────────────
@@ -333,59 +350,48 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    /** Shows download progress dialog and downloads the Piper model. */
-    private fun showPiperDownloadDialog(svc: TtsService) {
-        val dialogView = layoutInflater.inflate(android.R.layout.activity_list_item, null)
-        // Build a simple progress dialog manually (Material dialogs don't support ProgressBar natively)
-        val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            max       = 100
-            progress  = 0
-            isIndeterminate = false
-        }
-        val tvStatus = TextView(this).apply {
-            text    = "Đang chuẩn bị..."
-            setPadding(48, 16, 48, 0)
-        }
-
-        val dialog = MaterialAlertDialogBuilder(this)
-            .setTitle("⬇️ Tải Piper AI Model (~63MB)")
-            .setMessage("Mô hình sẽ được lưu trong bộ nhớ app.\nChỉ cần tải một lần, sau đó hoạt động offline.")
-            .setView(android.widget.LinearLayout(this).apply {
-                orientation = android.widget.LinearLayout.VERTICAL
-                setPadding(48, 16, 48, 16)
-                addView(progressBar)
-                addView(tvStatus)
-            })
-            .setCancelable(false)
-            .setNegativeButton("Hủy") { dlg, _ ->
-                dlg.dismiss()
-                // Cleanup partial download
-                lifecycleScope.launch(Dispatchers.IO) { svc.modelManager.deleteModel() }
-            }
-            .show()
+    /**
+     * Downloads the Piper model in the background (non-blocking).
+     * Shows live progress in the voice label; auto-enables Piper on completion.
+     * Safe to call multiple times — ignored if a download is already in progress.
+     */
+    private fun startPiperDownload(svc: TtsService) {
+        if (isPiperDownloading) return
+        isPiperDownloading = true
+        prefs.edit().putBoolean("piper_download_attempted", true).apply()
+        updateVoiceLabel()
 
         lifecycleScope.launch {
             try {
+                var lastReportedPct = -1
                 withContext(Dispatchers.IO) {
                     svc.modelManager.downloadModel { downloaded, total ->
-                        val pct = ((downloaded * 100) / total).toInt().coerceIn(0, 100)
-                        val mb  = downloaded / 1_000_000
-                        runOnUiThread {
-                            progressBar.progress = pct
-                            tvStatus.text = "Đã tải ${mb}MB / ~63MB  ($pct%)"
+                        val pct = ((downloaded * 100) / total).toInt().coerceIn(0, 99)
+                        // Throttle UI updates to every 2% change
+                        if (pct >= lastReportedPct + 2) {
+                            lastReportedPct = pct
+                            runOnUiThread { updateVoiceLabel(downloadPct = pct) }
                         }
                     }
                 }
-                dialog.dismiss()
-                enablePiperEngine(svc)
+                // Download complete → enable engine
+                val ok = withContext(Dispatchers.IO) { svc.enablePiperTts() }
+                isPiperDownloading = false
+                if (ok) {
+                    usePiper = true
+                    updateVoiceLabel()
+                    toast("🤖 Piper AI đã sẵn sàng!")
+                } else {
+                    updateVoiceLabel()
+                    toast("Lỗi khởi động Piper — thử chọn lại từ menu giọng đọc")
+                }
             } catch (e: Exception) {
-                dialog.dismiss()
+                isPiperDownloading = false
                 withContext(Dispatchers.IO) { svc.modelManager.deleteModel() }
-                MaterialAlertDialogBuilder(this@MainActivity)
-                    .setTitle("⚠️ Tải thất bại")
-                    .setMessage("Kiểm tra kết nối internet và thử lại.\nLỗi: ${e.message}")
-                    .setPositiveButton("OK", null)
-                    .show()
+                // Reset flag so user can retry
+                prefs.edit().putBoolean("piper_download_attempted", false).apply()
+                updateVoiceLabel()
+                toast("Lỗi tải Piper: ${e.message?.take(60)}")
             }
         }
     }
