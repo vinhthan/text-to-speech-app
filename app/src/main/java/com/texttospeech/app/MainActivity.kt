@@ -363,35 +363,40 @@ class MainActivity : AppCompatActivity() {
 
         lifecycleScope.launch {
             try {
+                // Phase 1: download files with live progress
                 var lastReportedPct = -1
                 withContext(Dispatchers.IO) {
                     svc.modelManager.downloadModel { downloaded, total ->
                         val pct = ((downloaded * 100) / total).toInt().coerceIn(0, 99)
-                        // Throttle UI updates to every 2% change
                         if (pct >= lastReportedPct + 2) {
                             lastReportedPct = pct
                             runOnUiThread { updateVoiceLabel(downloadPct = pct) }
                         }
                     }
                 }
-                // Download complete → enable engine
+
+                // Phase 2: load model into memory (can take 10–30 s)
+                binding.tvVoiceLabel.text = "⏳ Đang khởi động Piper AI..."
                 val ok = withContext(Dispatchers.IO) { svc.enablePiperTts() }
                 isPiperDownloading = false
+
                 if (ok) {
                     usePiper = true
                     updateVoiceLabel()
                     toast("🤖 Piper AI đã sẵn sàng!")
                 } else {
+                    // Init failed → model likely corrupted, delete and allow retry next launch
+                    withContext(Dispatchers.IO) { svc.modelManager.deleteModel() }
+                    prefs.edit().putBoolean("piper_download_attempted", false).apply()
                     updateVoiceLabel()
-                    toast("Lỗi khởi động Piper — thử chọn lại từ menu giọng đọc")
+                    toast("Lỗi khởi động Piper — sẽ tải lại khi mở app lần sau")
                 }
             } catch (e: Exception) {
                 isPiperDownloading = false
                 withContext(Dispatchers.IO) { svc.modelManager.deleteModel() }
-                // Reset flag so user can retry
                 prefs.edit().putBoolean("piper_download_attempted", false).apply()
                 updateVoiceLabel()
-                toast("Lỗi tải Piper: ${e.message?.take(60)}")
+                toast("Lỗi tải Piper: ${e.message?.take(80)}")
             }
         }
     }

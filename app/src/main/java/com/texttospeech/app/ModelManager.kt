@@ -5,7 +5,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
-import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -27,41 +26,43 @@ class ModelManager(private val context: Context) {
         private const val HF_API_URL = "https://huggingface.co/api/models/$HF_REPO"
         private const val HF_RAW_URL = "https://huggingface.co/$HF_REPO/resolve/main"
 
+        // Minimum acceptable ONNX size — detects a truncated download
+        private const val MIN_ONNX_BYTES = 50_000_000L   // 50 MB
+
         // Files to skip when downloading
         private val SKIP_FILES = setOf(
             ".gitattributes", "MODEL_CARD", "vits-piper.py", "vits-piper.sh",
-            "vi_VN-vais1000-medium.onnx.json"   // sherpa-onnx doesn't need this
+            "vi_VN-vais1000-medium.onnx.json"
         )
     }
 
-    val modelDir   = File(context.filesDir, "piper_vi_medium")
-    val espeakDir  = File(modelDir, "espeak-ng-data")
+    val modelDir  = File(context.filesDir, "piper_vi_medium")
+    val espeakDir = File(modelDir, "espeak-ng-data")
 
     // ─── State ───────────────────────────────────────────────────────────────
 
     fun isModelReady(): Boolean =
-        File(modelDir, MODEL_NAME).exists() &&
+        File(modelDir, MODEL_NAME).let { it.exists() && it.length() >= MIN_ONNX_BYTES } &&
         File(modelDir, "tokens.txt").exists() &&
         espeakDir.isDirectory && (espeakDir.list()?.isNotEmpty() == true)
 
     fun modelSizeBytes(): Long = File(modelDir, MODEL_NAME).length()
 
-    fun deleteModel() {
-        modelDir.deleteRecursively()
-    }
+    fun deleteModel() { modelDir.deleteRecursively() }
 
     // ─── Download ────────────────────────────────────────────────────────────
 
     /**
      * Downloads the complete model from HuggingFace.
+     * Each file is retried up to 3 times on failure.
      * @param onProgress callback(bytesDownloaded, totalEstimatedBytes)
-     * @throws Exception if download fails — caller must handle and clean up
+     * @throws Exception if download ultimately fails — caller cleans up
      */
     suspend fun downloadModel(onProgress: (Long, Long) -> Unit) = withContext(Dispatchers.IO) {
         modelDir.mkdirs()
 
-        // 1. Get file list from HuggingFace model API
-        val fileList = fetchFileList()
+        // 1. Get file list from HuggingFace model API (with retry)
+        val fileList = retryIO(tag = "fetchFileList") { fetchFileList() }
 
         // 2. Partition: large ONNX first, then everything else
         val onnxFile   = fileList.firstOrNull { it.endsWith(MODEL_NAME) }
@@ -72,62 +73,92 @@ class ModelManager(private val context: Context) {
         val estimatedTotal = 65_000_000L
         var downloaded = 0L
 
-        // 3. Download the large ONNX model first
+        // 3. Download ONNX model (large file — retry individually)
         val onnxDest = File(modelDir, MODEL_NAME)
-        downloadFile(
-            urlStr   = "$HF_RAW_URL/$onnxFile",
-            dest     = onnxDest,
-            onBytes  = { bytes ->
-                downloaded += bytes
-                onProgress(downloaded, estimatedTotal)
-            }
-        )
-
-        // 4. Download the rest (tokens.txt + espeak-ng-data/*)
-        for (filePath in otherFiles) {
-            val dest = File(modelDir, filePath)
-            dest.parentFile?.mkdirs()
-            downloadFile(
-                urlStr  = "$HF_RAW_URL/$filePath",
-                dest    = dest,
-                onBytes = { bytes ->
-                    downloaded += bytes
-                    onProgress(downloaded, estimatedTotal)
-                }
+        retryIO(tag = MODEL_NAME) {
+            onnxDest.delete()   // remove partial file before each attempt
+            downloaded = downloadFile(
+                urlStr      = "$HF_RAW_URL/$onnxFile",
+                dest        = onnxDest,
+                prevBytes   = downloaded,
+                onBytes     = { bytes -> downloaded += bytes; onProgress(downloaded, estimatedTotal) },
+                readTimeoutMs = 300_000   // 5-min timeout for the large model file
             )
         }
 
-        // Clamp to 100%
+        // Verify ONNX is complete
+        val onnxSize = onnxDest.length()
+        if (onnxSize < MIN_ONNX_BYTES) {
+            throw Exception("File model bị không đầy đủ (${onnxSize / 1_000_000}MB < 50MB). Vui lòng thử lại.")
+        }
+
+        // 4. Download supporting files (tokens.txt + espeak-ng-data/*)
+        for (filePath in otherFiles) {
+            val dest = File(modelDir, filePath)
+            dest.parentFile?.mkdirs()
+            retryIO(tag = filePath) {
+                dest.delete()
+                downloaded = downloadFile(
+                    urlStr    = "$HF_RAW_URL/$filePath",
+                    dest      = dest,
+                    prevBytes = downloaded,
+                    onBytes   = { bytes -> downloaded += bytes; onProgress(downloaded, estimatedTotal) }
+                )
+            }
+        }
+
+        // Signal 100% complete
         onProgress(estimatedTotal, estimatedTotal)
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────────────
 
     /**
-     * Fetches the model file list from the HuggingFace API.
-     * Returns paths relative to the repo root.
+     * Retries [block] up to 3 times with exponential back-off (2 s, 4 s).
+     * Throws the last exception if all attempts fail.
+     */
+    private fun <T> retryIO(tag: String, block: () -> T): T {
+        var lastError: Exception? = null
+        repeat(3) { attempt ->
+            try {
+                return block()
+            } catch (e: Exception) {
+                lastError = e
+                if (attempt < 2) Thread.sleep(2000L * (attempt + 1))
+            }
+        }
+        throw lastError ?: Exception("Lỗi không xác định khi tải: $tag")
+    }
+
+    /**
+     * Fetches the model file list from the HuggingFace model API.
+     * Returns paths relative to the repo root (e.g. "espeak-ng-data/vi").
      */
     private fun fetchFileList(): List<String> {
         val conn = openUrl(HF_API_URL)
         val json = conn.inputStream.bufferedReader().readText()
         conn.disconnect()
-
         val obj = JSONObject(json)
         val siblings = obj.getJSONArray("siblings")
-        val result = mutableListOf<String>()
-        for (i in 0 until siblings.length()) {
-            val name = siblings.getJSONObject(i).getString("rfilename")
-            result += name
+        return (0 until siblings.length()).map { i ->
+            siblings.getJSONObject(i).getString("rfilename")
         }
-        return result
     }
 
     /**
-     * Downloads [urlStr] to [dest], following redirects (required for GitHub/HuggingFace CDN).
-     * Calls [onBytes] after each buffer write with the number of bytes written.
+     * Downloads [urlStr] to [dest].
+     * @param prevBytes bytes already counted before this call (used for retry accounting)
+     * @param readTimeoutMs per-read idle timeout; default 90 s
+     * @return [prevBytes] unchanged — progress accounting is via [onBytes] side-effect
      */
-    private fun downloadFile(urlStr: String, dest: File, onBytes: (Long) -> Unit) {
-        val conn = openUrl(urlStr)
+    private fun downloadFile(
+        urlStr: String,
+        dest: File,
+        prevBytes: Long,
+        onBytes: (Long) -> Unit,
+        readTimeoutMs: Int = 90_000
+    ): Long {
+        val conn = openUrl(urlStr, readTimeoutMs)
         try {
             conn.inputStream.use { input ->
                 dest.outputStream().use { output ->
@@ -142,20 +173,21 @@ class ModelManager(private val context: Context) {
         } finally {
             conn.disconnect()
         }
+        return prevBytes   // unused; progress tracked via onBytes
     }
 
     /**
-     * Opens a URL following HTTP redirects across different hosts
-     * (GitHub → Objects CDN, HuggingFace → AWS CDN).
+     * Opens a URL following HTTP redirects across different hosts.
+     * Handles both absolute and relative Location headers.
      */
-    private fun openUrl(urlStr: String): HttpURLConnection {
+    private fun openUrl(urlStr: String, readTimeoutMs: Int = 90_000): HttpURLConnection {
         var current = urlStr
-        repeat(10) {   // max 10 redirects
+        repeat(10) {
             val conn = URL(current).openConnection() as HttpURLConnection
             conn.instanceFollowRedirects = false
             conn.setRequestProperty("User-Agent", "Mozilla/5.0 Android")
             conn.connectTimeout = 30_000
-            conn.readTimeout    = 60_000
+            conn.readTimeout    = readTimeoutMs
             conn.connect()
             return when (conn.responseCode) {
                 HttpURLConnection.HTTP_OK,
@@ -166,13 +198,12 @@ class ModelManager(private val context: Context) {
                     val loc = conn.getHeaderField("Location")
                         ?: throw Exception("Redirect without Location header")
                     conn.disconnect()
-                    // Resolve relative redirects (e.g. HuggingFace returns "/api/resolve-cache/...")
                     current = if (loc.startsWith("http://") || loc.startsWith("https://")) {
                         loc
                     } else {
                         URL(URL(current), loc).toString()
                     }
-                    return@repeat   // continue loop
+                    return@repeat
                 }
                 else -> throw Exception("HTTP ${conn.responseCode} for $current")
             }
