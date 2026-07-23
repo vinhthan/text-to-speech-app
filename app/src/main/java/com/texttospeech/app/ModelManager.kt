@@ -1,44 +1,42 @@
 package com.texttospeech.app
 
 import android.content.Context
+import android.content.res.AssetManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
-import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream
 import java.io.File
-import java.io.FilterInputStream
-import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
 /**
  * Downloads and manages the Piper TTS model.
  *
- * Source: sherpa-onnx GitHub releases — single tar.bz2 (67 MB compressed).
- * Extraction is streamed: the tarball is never saved to disk in full.
+ * Strategy:
+ *   • espeak-ng-data (355 files, ~5 MB) — bundled inside the APK as assets
+ *     (extracted from the sherpa-onnx tarball during CI build, zero network cost).
+ *   • tokens.txt — same, bundled as assets/piper_tokens.txt.
+ *   • ONNX model (~62 MB) — downloaded once from HuggingFace at first launch.
  *
- * Final layout on device (filesDir/piper_vi_medium/):
- *   ├── vi_VN-vais1000-medium.onnx   (~60 MB)
- *   ├── tokens.txt
- *   └── espeak-ng-data/  (355 files for all espeak-ng languages)
+ * This avoids any dependency on GitHub CDN at runtime.
  */
 class ModelManager(private val context: Context) {
 
     companion object {
         const val MODEL_NAME = "vi_VN-vais1000-medium.onnx"
 
-        /** Single tarball — replaces 362 individual HuggingFace requests. */
-        private const val TARBALL_URL =
-            "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-vi_VN-vais1000-medium.tar.bz2"
+        /** ONNX download URL — HuggingFace (accessible globally). */
+        private const val ONNX_URL =
+            "https://huggingface.co/csukuangfj/vits-piper-vi_VN-vais1000-medium/resolve/main/$MODEL_NAME"
 
-        /** Known compressed size in bytes — used when Content-Length is absent. */
-        private const val TARBALL_BYTES = 67_154_040L
+        /** Known ONNX size (for progress when Content-Length is absent). */
+        private const val ONNX_BYTES = 62_000_000L
 
-        /** Top-level directory inside the tarball to strip from paths. */
-        private const val TAR_PREFIX = "vits-piper-vi_VN-vais1000-medium/"
-
-        /** Minimum acceptable ONNX size — detects a truncated extraction. */
+        /** Minimum acceptable ONNX size — detects a truncated download. */
         private const val MIN_ONNX_BYTES = 50_000_000L
+
+        /** Asset paths — populated by CI before the Gradle build. */
+        private const val ASSET_ESPEAK = "piper_espeak_ng_data"
+        private const val ASSET_TOKENS = "piper_tokens.txt"
     }
 
     val modelDir  = File(context.filesDir, "piper_vi_medium")
@@ -53,50 +51,45 @@ class ModelManager(private val context: Context) {
 
     fun deleteModel() { modelDir.deleteRecursively() }
 
-    // ─── Download + extraction ────────────────────────────────────────────────
+    // ─── Download ────────────────────────────────────────────────────────────
 
     /**
-     * Downloads the model tarball and extracts it on-the-fly (no temporary file).
-     * Retries the entire operation up to 3 times on failure.
+     * Sets up the model:
+     *   1. Copies espeak-ng-data + tokens.txt from APK assets to filesDir (fast, no network).
+     *   2. Downloads the ONNX model from HuggingFace if not already present (~62 MB).
      *
-     * @param onProgress callback(compressedBytesRead, totalCompressedBytes)
+     * @param onProgress callback(bytesDownloaded, totalBytes)
      * @throws Exception on unrecoverable failure — caller cleans up
      */
     suspend fun downloadModel(onProgress: (Long, Long) -> Unit) = withContext(Dispatchers.IO) {
         modelDir.mkdirs()
 
-        retryIO("tarball") {
-            val conn = openUrl(TARBALL_URL, readTimeoutMs = 600_000)   // 10-min cap
-            val total = conn.contentLengthLong.takeIf { it > 0 } ?: TARBALL_BYTES
-            var downloaded = 0L
+        // 1. Copy bundled assets (instant, no network)
+        copyBundledAssets()
 
+        // 2. Download ONNX (only if missing or incomplete)
+        val onnxDest = File(modelDir, MODEL_NAME)
+        if (onnxDest.length() >= MIN_ONNX_BYTES) {
+            // Already have a valid ONNX — assets were re-copied above, we're done
+            onProgress(ONNX_BYTES, ONNX_BYTES)
+            return@withContext
+        }
+
+        var downloaded = 0L
+        retryIO("onnx") {
+            onnxDest.delete()
+            downloaded = 0L
+            val conn = openUrl(ONNX_URL, readTimeoutMs = 300_000)   // 5-min idle timeout
+            val total = conn.contentLengthLong.takeIf { it > 0 } ?: ONNX_BYTES
             try {
-                // Wrap HTTP stream in a progress-counting shim, then pipe through
-                // BZip2 decompressor and TAR reader — no temp file needed.
-                val counting = object : FilterInputStream(conn.inputStream) {
-                    override fun read(b: ByteArray, off: Int, len: Int): Int {
-                        val n = super.read(b, off, len)
-                        if (n > 0) { downloaded += n; onProgress(downloaded, total) }
-                        return n
-                    }
-                }
-
-                BZip2CompressorInputStream(counting).use { bzIn ->
-                    TarArchiveInputStream(bzIn).use { tarIn ->
-                        var entry = tarIn.nextTarEntry
-                        while (entry != null) {
-                            // Strip top-level directory (e.g. "vits-piper-.../tokens.txt" → "tokens.txt")
-                            val rel = entry.name.removePrefix(TAR_PREFIX)
-                            if (rel.isNotEmpty()) {
-                                val dest = File(modelDir, rel)
-                                if (entry.isDirectory) {
-                                    dest.mkdirs()
-                                } else {
-                                    dest.parentFile?.mkdirs()
-                                    dest.outputStream().use { out -> tarIn.copyTo(out) }
-                                }
-                            }
-                            entry = tarIn.nextTarEntry
+                conn.inputStream.use { input ->
+                    onnxDest.outputStream().use { output ->
+                        val buf = ByteArray(64 * 1024)
+                        var n: Int
+                        while (input.read(buf).also { n = it } != -1) {
+                            output.write(buf, 0, n)
+                            downloaded += n
+                            onProgress(downloaded, total)
                         }
                     }
                 }
@@ -105,13 +98,49 @@ class ModelManager(private val context: Context) {
             }
         }
 
-        // Verify the main model file is intact
-        val onnxSize = File(modelDir, MODEL_NAME).length()
+        // 3. Verify integrity
+        val onnxSize = onnxDest.length()
         if (onnxSize < MIN_ONNX_BYTES) {
-            throw Exception("Model bị lỗi khi giải nén (${onnxSize / 1_000_000} MB < 50 MB). Thử lại.")
+            throw Exception("Model bị lỗi khi tải (${onnxSize / 1_000_000} MB). Thử lại.")
         }
 
-        onProgress(TARBALL_BYTES, TARBALL_BYTES)   // clamp to 100 %
+        onProgress(ONNX_BYTES, ONNX_BYTES)
+    }
+
+    // ─── Asset copy ──────────────────────────────────────────────────────────
+
+    /**
+     * Copies espeak-ng-data and tokens.txt from APK assets to [modelDir].
+     * Skips files that are already present (idempotent, fast on subsequent calls).
+     */
+    private fun copyBundledAssets() {
+        val assets = context.assets
+
+        // tokens.txt
+        val tokensDest = File(modelDir, "tokens.txt")
+        if (!tokensDest.exists()) {
+            assets.open(ASSET_TOKENS).use { it.copyTo(tokensDest.outputStream()) }
+        }
+
+        // espeak-ng-data/ (recursive)
+        if (!espeakDir.isDirectory || espeakDir.list()?.isEmpty() != false) {
+            copyAssetDir(assets, ASSET_ESPEAK, espeakDir)
+        }
+    }
+
+    private fun copyAssetDir(assets: AssetManager, assetPath: String, destDir: File) {
+        destDir.mkdirs()
+        for (child in assets.list(assetPath) ?: return) {
+            val childAsset = "$assetPath/$child"
+            val childDest  = File(destDir, child)
+            try {
+                // Open as a file — throws if it's actually a directory
+                assets.open(childAsset).use { it.copyTo(childDest.outputStream()) }
+            } catch (_: Exception) {
+                // It's a sub-directory — recurse
+                copyAssetDir(assets, childAsset, childDest)
+            }
+        }
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────────────
@@ -120,9 +149,7 @@ class ModelManager(private val context: Context) {
     private fun <T> retryIO(tag: String, block: () -> T): T {
         var lastErr: Exception? = null
         repeat(3) { attempt ->
-            try {
-                return block()
-            } catch (e: Exception) {
+            try { return block() } catch (e: Exception) {
                 lastErr = e
                 if (attempt < 2) Thread.sleep(2000L * (attempt + 1))
             }
@@ -132,7 +159,6 @@ class ModelManager(private val context: Context) {
 
     /**
      * Opens a URL following HTTP redirects (absolute and relative Location headers).
-     * [readTimeoutMs] is the per-read idle timeout; set it large for big files.
      */
     private fun openUrl(urlStr: String, readTimeoutMs: Int = 90_000): HttpURLConnection {
         var current = urlStr
@@ -152,11 +178,8 @@ class ModelManager(private val context: Context) {
                     val loc = conn.getHeaderField("Location")
                         ?: throw Exception("Redirect without Location header")
                     conn.disconnect()
-                    current = if (loc.startsWith("http://") || loc.startsWith("https://")) {
-                        loc
-                    } else {
-                        URL(URL(current), loc).toString()
-                    }
+                    current = if (loc.startsWith("http://") || loc.startsWith("https://")) loc
+                              else URL(URL(current), loc).toString()
                     return@repeat
                 }
                 else -> throw Exception("HTTP ${conn.responseCode} for $current")

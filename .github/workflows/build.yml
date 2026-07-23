@@ -76,6 +76,19 @@ jobs:
           ls -lh app/src/main/jniLibs/arm64-v8a/ 2>/dev/null || echo "WARNING: arm64-v8a libs missing"
           ls -lh app/src/main/jniLibs/armeabi-v7a/ 2>/dev/null || echo "WARNING: armeabi-v7a libs missing"
 
+      - name: Bundle Piper espeak-ng-data + tokens into APK assets
+        run: |
+          mkdir -p app/src/main/assets
+          echo "Downloading Piper model tarball (~67MB) to extract support files..."
+          curl -fL "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-vi_VN-vais1000-medium.tar.bz2" \
+            | tar xj --strip-components=1 \
+                -C app/src/main/assets \
+                "vits-piper-vi_VN-vais1000-medium/espeak-ng-data" \
+                "vits-piper-vi_VN-vais1000-medium/tokens.txt"
+          mv app/src/main/assets/espeak-ng-data app/src/main/assets/piper_espeak_ng_data
+          mv app/src/main/assets/tokens.txt     app/src/main/assets/piper_tokens.txt
+          echo "Bundled $(find app/src/main/assets/piper_espeak_ng_data -type f | wc -l) espeak-ng-data files + tokens.txt"
+
       - name: Build Debug APK
         run: ./gradlew assembleDebug --stacktrace
 
