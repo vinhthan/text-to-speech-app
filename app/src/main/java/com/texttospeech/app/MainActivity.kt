@@ -244,11 +244,11 @@ class MainActivity : AppCompatActivity() {
     private fun updateVoiceLabel(downloadPct: Int = -1) {
         when {
             downloadPct in 0..99 ->
-                binding.tvVoiceLabel.text = "⬇️ Đang tải Piper AI ($downloadPct%)"
+                binding.tvVoiceLabel.text = "⚙️ Đang cài đặt Piper AI ($downloadPct%)"
             ttsService?.isPiperEnabled() == true ->
                 binding.tvVoiceLabel.text = "🤖 Piper AI (Offline Neural)"
             isPiperDownloading ->
-                binding.tvVoiceLabel.text = "⬇️ Đang tải Piper AI..."
+                binding.tvVoiceLabel.text = "⚙️ Đang cài đặt Piper AI..."
             else -> {
                 val voice = tts?.getCurrentVoice()
                 binding.tvVoiceLabel.text = if (voice != null) {
@@ -273,8 +273,8 @@ class MainActivity : AppCompatActivity() {
         val piperLabel = buildString {
             append("🤖 Piper AI (Offline Neural)")
             if (isPiperActive) append(" ✓")
-            if (isPiperDownloading) append("  [⬇️ Đang tải...]")
-            else if (!isPiperReady) append("  [Chưa tải ~63MB]")
+            if (isPiperDownloading) append("  [⚙️ Đang cài đặt...]")
+            else if (!isPiperReady) append("  [Chưa cài đặt]")
         }
 
         val androidLabels = androidVoices.map { item ->
@@ -303,7 +303,7 @@ class MainActivity : AppCompatActivity() {
                     // ── Piper AI selected ─────────────────────────────────
                     when {
                         isPiperActive      -> { /* already active — nothing to do */ }
-                        isPiperDownloading -> toast("⬇️ Đang tải... vui lòng đợi")
+                        isPiperDownloading -> toast("⚙️ Đang cài đặt... vui lòng đợi")
                         isPiperReady       -> enablePiperEngine(svc)
                         else               -> startPiperDownload(svc)
                     }
@@ -349,10 +349,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Downloads the Piper model in the background (non-blocking).
+     * Copies the bundled Piper model from APK assets to internal storage (first launch only).
      * Shows live MB / % progress in the voice label; auto-enables Piper on completion.
-     * Supports resuming an interrupted download — partial files are kept on failure.
-     * Safe to call multiple times — ignored if a download is already in progress.
+     * No internet required — everything is already in the APK.
+     * Safe to call multiple times — ignored if setup is already in progress.
      */
     private fun startPiperDownload(svc: TtsService) {
         if (isPiperDownloading) return
@@ -361,17 +361,17 @@ class MainActivity : AppCompatActivity() {
 
         lifecycleScope.launch {
             try {
-                // Phase 1: copy assets + download ONNX with resume support
+                // Phase 1: copy model files from APK assets to internal storage
                 var lastReportedPct = -1
                 withContext(Dispatchers.IO) {
-                    svc.modelManager.downloadModel { downloaded, total ->
-                        val pct  = ((downloaded * 100) / total).toInt().coerceIn(0, 99)
-                        val mb   = downloaded / 1_000_000
+                    svc.modelManager.setupModel { copied, total ->
+                        val pct  = ((copied * 100) / total).toInt().coerceIn(0, 99)
+                        val mb   = copied / 1_000_000
                         val totMb = total / 1_000_000
                         if (pct >= lastReportedPct + 1) {
                             lastReportedPct = pct
                             runOnUiThread {
-                                binding.tvVoiceLabel.text = "⬇️ Piper AI: ${mb}MB / ${totMb}MB ($pct%)"
+                                binding.tvVoiceLabel.text = "⚙️ Piper AI: ${mb}MB / ${totMb}MB ($pct%)"
                             }
                         }
                     }
@@ -387,17 +387,16 @@ class MainActivity : AppCompatActivity() {
                     updateVoiceLabel()
                     toast("🤖 Piper AI đã sẵn sàng!")
                 } else {
-                    // Init failed (wrong model/JNI error) → delete all and retry next time
+                    // Init failed (wrong model/JNI error) → delete and retry next launch
                     withContext(Dispatchers.IO) { svc.modelManager.deleteModel() }
                     updateVoiceLabel()
-                    toast("Lỗi khởi động Piper — sẽ tải lại lần sau")
+                    toast("Lỗi khởi động Piper — sẽ thử lại lần sau")
                 }
             } catch (e: Exception) {
                 isPiperDownloading = false
-                // Keep partial ONNX on disk so the next attempt can resume.
-                // Only show the error — user can retry via Voice Picker → Piper AI.
+                withContext(Dispatchers.IO) { svc.modelManager.deleteModel() }
                 updateVoiceLabel()
-                toast("Lỗi tải Piper: ${e.message?.take(100)}")
+                toast("Lỗi cài đặt Piper: ${e.message?.take(100)}")
             }
         }
     }

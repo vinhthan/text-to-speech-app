@@ -57,6 +57,12 @@ android {
             useLegacyPackaging false
         }
     }
+
+    // Store the ONNX model uncompressed inside the APK so AssetManager can
+    // stream it directly without in-memory decompression overhead.
+    androidResources {
+        noCompress += ["onnx"]
+    }
 }
 
 dependencies {
