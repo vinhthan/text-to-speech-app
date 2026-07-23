@@ -91,12 +91,10 @@ class MainActivity : AppCompatActivity() {
                     usePiper = false  // model was deleted externally
                 }
             }
-            // Auto-download Piper model on first launch (once, in background)
+            // Auto-download Piper model whenever it's not ready and nothing is in progress.
+            // No "attempted" flag — we always retry so a failed/interrupted download resumes.
             val svcForDownload = ttsService ?: return
-            if (!svcForDownload.modelManager.isModelReady()
-                && !isPiperDownloading
-                && !prefs.getBoolean("piper_download_attempted", false)
-            ) {
+            if (!svcForDownload.modelManager.isModelReady() && !isPiperDownloading) {
                 startPiperDownload(svcForDownload)
             }
         }
@@ -352,33 +350,34 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Downloads the Piper model in the background (non-blocking).
-     * Shows live progress in the voice label; auto-enables Piper on completion.
+     * Shows live MB / % progress in the voice label; auto-enables Piper on completion.
+     * Supports resuming an interrupted download — partial files are kept on failure.
      * Safe to call multiple times — ignored if a download is already in progress.
      */
     private fun startPiperDownload(svc: TtsService) {
         if (isPiperDownloading) return
         isPiperDownloading = true
-        prefs.edit().putBoolean("piper_download_attempted", true).apply()
         updateVoiceLabel()
 
         lifecycleScope.launch {
             try {
-                // Phase 1: download files with live progress
+                // Phase 1: copy assets + download ONNX with resume support
                 var lastReportedPct = -1
                 withContext(Dispatchers.IO) {
                     svc.modelManager.downloadModel { downloaded, total ->
-                        val pct = ((downloaded * 100) / total).toInt().coerceIn(0, 99)
-                        val mb  = downloaded / 1_000_000
+                        val pct  = ((downloaded * 100) / total).toInt().coerceIn(0, 99)
+                        val mb   = downloaded / 1_000_000
+                        val totMb = total / 1_000_000
                         if (pct >= lastReportedPct + 1) {
                             lastReportedPct = pct
                             runOnUiThread {
-                                binding.tvVoiceLabel.text = "⬇️ Piper AI: ${mb}MB / 67MB ($pct%)"
+                                binding.tvVoiceLabel.text = "⬇️ Piper AI: ${mb}MB / ${totMb}MB ($pct%)"
                             }
                         }
                     }
                 }
 
-                // Phase 2: load model into memory (can take 10–30 s)
+                // Phase 2: load model into memory (10–30 s)
                 binding.tvVoiceLabel.text = "⏳ Đang khởi động Piper AI..."
                 val ok = withContext(Dispatchers.IO) { svc.enablePiperTts() }
                 isPiperDownloading = false
@@ -388,18 +387,17 @@ class MainActivity : AppCompatActivity() {
                     updateVoiceLabel()
                     toast("🤖 Piper AI đã sẵn sàng!")
                 } else {
-                    // Init failed → model likely corrupted, delete and allow retry next launch
+                    // Init failed (wrong model/JNI error) → delete all and retry next time
                     withContext(Dispatchers.IO) { svc.modelManager.deleteModel() }
-                    prefs.edit().putBoolean("piper_download_attempted", false).apply()
                     updateVoiceLabel()
-                    toast("Lỗi khởi động Piper — sẽ tải lại khi mở app lần sau")
+                    toast("Lỗi khởi động Piper — sẽ tải lại lần sau")
                 }
             } catch (e: Exception) {
                 isPiperDownloading = false
-                withContext(Dispatchers.IO) { svc.modelManager.deleteModel() }
-                prefs.edit().putBoolean("piper_download_attempted", false).apply()
+                // Keep partial ONNX on disk so the next attempt can resume.
+                // Only show the error — user can retry via Voice Picker → Piper AI.
                 updateVoiceLabel()
-                toast("Lỗi tải Piper: ${e.message?.take(80)}")
+                toast("Lỗi tải Piper: ${e.message?.take(100)}")
             }
         }
     }

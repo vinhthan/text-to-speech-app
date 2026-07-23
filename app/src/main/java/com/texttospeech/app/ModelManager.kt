@@ -5,6 +5,7 @@ import android.content.res.AssetManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -15,7 +16,8 @@ import java.net.URL
  *   • espeak-ng-data (355 files, ~5 MB) — bundled inside the APK as assets
  *     (extracted from the sherpa-onnx tarball during CI build, zero network cost).
  *   • tokens.txt — same, bundled as assets/piper_tokens.txt.
- *   • ONNX model (~62 MB) — downloaded once from HuggingFace at first launch.
+ *   • ONNX model (~62 MB) — downloaded once from HuggingFace at first launch,
+ *     with resume support so a interrupted download continues where it left off.
  *
  * This avoids any dependency on GitHub CDN at runtime.
  */
@@ -29,7 +31,7 @@ class ModelManager(private val context: Context) {
             "https://huggingface.co/csukuangfj/vits-piper-vi_VN-vais1000-medium/resolve/main/$MODEL_NAME"
 
         /** Known ONNX size (for progress when Content-Length is absent). */
-        private const val ONNX_BYTES = 62_000_000L
+        const val ONNX_BYTES = 62_000_000L
 
         /** Minimum acceptable ONNX size — detects a truncated download. */
         private const val MIN_ONNX_BYTES = 50_000_000L
@@ -57,9 +59,10 @@ class ModelManager(private val context: Context) {
      * Sets up the model:
      *   1. Copies espeak-ng-data + tokens.txt from APK assets to filesDir (fast, no network).
      *   2. Downloads the ONNX model from HuggingFace if not already present (~62 MB).
+     *      Supports resuming an interrupted download via HTTP Range header.
      *
      * @param onProgress callback(bytesDownloaded, totalBytes)
-     * @throws Exception on unrecoverable failure — caller cleans up
+     * @throws Exception on unrecoverable failure — caller decides whether to clean up
      */
     suspend fun downloadModel(onProgress: (Long, Long) -> Unit) = withContext(Dispatchers.IO) {
         modelDir.mkdirs()
@@ -67,7 +70,7 @@ class ModelManager(private val context: Context) {
         // 1. Copy bundled assets (instant, no network)
         copyBundledAssets()
 
-        // 2. Download ONNX (only if missing or incomplete)
+        // 2. Download ONNX with resume support
         val onnxDest = File(modelDir, MODEL_NAME)
         if (onnxDest.length() >= MIN_ONNX_BYTES) {
             // Already have a valid ONNX — assets were re-copied above, we're done
@@ -75,15 +78,47 @@ class ModelManager(private val context: Context) {
             return@withContext
         }
 
-        var downloaded = 0L
+        downloadOnnxWithResume(onnxDest, onProgress)
+
+        // 3. Verify integrity
+        val onnxSize = onnxDest.length()
+        if (onnxSize < MIN_ONNX_BYTES) {
+            throw Exception("Model bị lỗi khi tải (${onnxSize / 1_000_000} MB / 62 MB). Thử lại.")
+        }
+
+        onProgress(ONNX_BYTES, ONNX_BYTES)
+    }
+
+    /**
+     * Downloads the ONNX file, resuming from the current file size if possible.
+     * On each retry: tries to resume first; if the server doesn't support Range,
+     * falls back to a full download.  Does NOT delete the partial file before
+     * retrying — that preserves the resume capability.
+     */
+    private fun downloadOnnxWithResume(onnxDest: File, onProgress: (Long, Long) -> Unit) {
         retryIO("onnx") {
-            onnxDest.delete()
-            downloaded = 0L
-            val conn = openUrl(ONNX_URL, readTimeoutMs = 300_000)   // 5-min idle timeout
-            val total = conn.contentLengthLong.takeIf { it > 0 } ?: ONNX_BYTES
+            val resumeFrom = onnxDest.length()
+            val conn       = openUrl(ONNX_URL, readTimeoutMs = 300_000, rangeStart = resumeFrom)
+            val isResume   = conn.responseCode == HttpURLConnection.HTTP_PARTIAL
+
+            if (!isResume && resumeFrom > 0) {
+                // Server doesn't support Range → start fresh
+                onnxDest.delete()
+            }
+
+            val offset        = if (isResume) resumeFrom else 0L
+            val serverLen     = conn.contentLengthLong
+            val total = when {
+                isResume  && serverLen > 0 -> resumeFrom + serverLen   // full size
+                !isResume && serverLen > 0 -> serverLen
+                else -> ONNX_BYTES
+            }
+            var downloaded = offset
+
             try {
                 conn.inputStream.use { input ->
-                    onnxDest.outputStream().use { output ->
+                    // append=true keeps bytes already on disk when resuming
+                    FileOutputStream(onnxDest, isResume).use { output ->
                         val buf = ByteArray(64 * 1024)
                         var n: Int
                         while (input.read(buf).also { n = it } != -1) {
@@ -97,14 +132,6 @@ class ModelManager(private val context: Context) {
                 conn.disconnect()
             }
         }
-
-        // 3. Verify integrity
-        val onnxSize = onnxDest.length()
-        if (onnxSize < MIN_ONNX_BYTES) {
-            throw Exception("Model bị lỗi khi tải (${onnxSize / 1_000_000} MB). Thử lại.")
-        }
-
-        onProgress(ONNX_BYTES, ONNX_BYTES)
     }
 
     // ─── Asset copy ──────────────────────────────────────────────────────────
@@ -159,13 +186,15 @@ class ModelManager(private val context: Context) {
 
     /**
      * Opens a URL following HTTP redirects (absolute and relative Location headers).
+     * If [rangeStart] > 0, adds a Range header to resume a partial download.
      */
-    private fun openUrl(urlStr: String, readTimeoutMs: Int = 90_000): HttpURLConnection {
+    private fun openUrl(urlStr: String, readTimeoutMs: Int = 90_000, rangeStart: Long = 0): HttpURLConnection {
         var current = urlStr
         repeat(10) {
             val conn = URL(current).openConnection() as HttpURLConnection
             conn.instanceFollowRedirects = false
             conn.setRequestProperty("User-Agent", "Mozilla/5.0 Android")
+            if (rangeStart > 0) conn.setRequestProperty("Range", "bytes=$rangeStart-")
             conn.connectTimeout = 30_000
             conn.readTimeout    = readTimeoutMs
             conn.connect()
