@@ -368,9 +368,12 @@ class MainActivity : AppCompatActivity() {
                 withContext(Dispatchers.IO) {
                     svc.modelManager.downloadModel { downloaded, total ->
                         val pct = ((downloaded * 100) / total).toInt().coerceIn(0, 99)
-                        if (pct >= lastReportedPct + 2) {
+                        val mb  = downloaded / 1_000_000
+                        if (pct >= lastReportedPct + 1) {
                             lastReportedPct = pct
-                            runOnUiThread { updateVoiceLabel(downloadPct = pct) }
+                            runOnUiThread {
+                                binding.tvVoiceLabel.text = "⬇️ Piper AI: ${mb}MB / 67MB ($pct%)"
+                            }
                         }
                     }
                 }

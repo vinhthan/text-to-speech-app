@@ -49,7 +49,9 @@ android {
                 'META-INF/NOTICE',
                 'META-INF/NOTICE.txt',
                 'META-INF/AL2.0',
-                'META-INF/LGPL2.1'
+                'META-INF/LGPL2.1',
+                'META-INF/LICENSE.md',
+                'META-INF/NOTICE.md'
             ]
         }
         // Keep native .so files uncompressed for faster loading (API 23+)
@@ -79,6 +81,9 @@ dependencies {
 
     // MediaStyle notification (for lockscreen/notification playback controls)
     implementation 'androidx.media:media:1.7.0'
+
+    // BZip2 + TAR extraction (for Piper model tarball download)
+    implementation 'org.apache.commons:commons-compress:1.26.1'
 
     // sherpa-onnx native libs are added via jniLibs/ directory (no AAR needed)
     // The Kotlin API (SherpaOnnxTts.kt) is included as a source file in this project.

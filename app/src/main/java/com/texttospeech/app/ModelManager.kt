@@ -3,37 +3,42 @@ package com.texttospeech.app
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.json.JSONObject
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream
 import java.io.File
+import java.io.FilterInputStream
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * Downloads and manages the Piper TTS model files from HuggingFace.
+ * Downloads and manages the Piper TTS model.
  *
- * Model: csukuangfj/vits-piper-vi_VN-vais1000-medium
- * Structure after download:
- *   filesDir/piper_vi_medium/
- *     ├── vi_VN-vais1000-medium.onnx   (~60MB, main model)
- *     ├── tokens.txt                   (~3KB)
- *     └── espeak-ng-data/              (~3MB, 200+ small files)
+ * Source: sherpa-onnx GitHub releases — single tar.bz2 (67 MB compressed).
+ * Extraction is streamed: the tarball is never saved to disk in full.
+ *
+ * Final layout on device (filesDir/piper_vi_medium/):
+ *   ├── vi_VN-vais1000-medium.onnx   (~60 MB)
+ *   ├── tokens.txt
+ *   └── espeak-ng-data/  (355 files for all espeak-ng languages)
  */
 class ModelManager(private val context: Context) {
 
     companion object {
-        const val HF_REPO      = "csukuangfj/vits-piper-vi_VN-vais1000-medium"
-        const val MODEL_NAME   = "vi_VN-vais1000-medium.onnx"
-        private const val HF_API_URL = "https://huggingface.co/api/models/$HF_REPO"
-        private const val HF_RAW_URL = "https://huggingface.co/$HF_REPO/resolve/main"
+        const val MODEL_NAME = "vi_VN-vais1000-medium.onnx"
 
-        // Minimum acceptable ONNX size — detects a truncated download
-        private const val MIN_ONNX_BYTES = 50_000_000L   // 50 MB
+        /** Single tarball — replaces 362 individual HuggingFace requests. */
+        private const val TARBALL_URL =
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-vi_VN-vais1000-medium.tar.bz2"
 
-        // Files to skip when downloading
-        private val SKIP_FILES = setOf(
-            ".gitattributes", "MODEL_CARD", "vits-piper.py", "vits-piper.sh",
-            "vi_VN-vais1000-medium.onnx.json"
-        )
+        /** Known compressed size in bytes — used when Content-Length is absent. */
+        private const val TARBALL_BYTES = 67_154_040L
+
+        /** Top-level directory inside the tarball to strip from paths. */
+        private const val TAR_PREFIX = "vits-piper-vi_VN-vais1000-medium/"
+
+        /** Minimum acceptable ONNX size — detects a truncated extraction. */
+        private const val MIN_ONNX_BYTES = 50_000_000L
     }
 
     val modelDir  = File(context.filesDir, "piper_vi_medium")
@@ -46,139 +51,88 @@ class ModelManager(private val context: Context) {
         File(modelDir, "tokens.txt").exists() &&
         espeakDir.isDirectory && (espeakDir.list()?.isNotEmpty() == true)
 
-    fun modelSizeBytes(): Long = File(modelDir, MODEL_NAME).length()
-
     fun deleteModel() { modelDir.deleteRecursively() }
 
-    // ─── Download ────────────────────────────────────────────────────────────
+    // ─── Download + extraction ────────────────────────────────────────────────
 
     /**
-     * Downloads the complete model from HuggingFace.
-     * Each file is retried up to 3 times on failure.
-     * @param onProgress callback(bytesDownloaded, totalEstimatedBytes)
-     * @throws Exception if download ultimately fails — caller cleans up
+     * Downloads the model tarball and extracts it on-the-fly (no temporary file).
+     * Retries the entire operation up to 3 times on failure.
+     *
+     * @param onProgress callback(compressedBytesRead, totalCompressedBytes)
+     * @throws Exception on unrecoverable failure — caller cleans up
      */
     suspend fun downloadModel(onProgress: (Long, Long) -> Unit) = withContext(Dispatchers.IO) {
         modelDir.mkdirs()
 
-        // 1. Get file list from HuggingFace model API (with retry)
-        val fileList = retryIO(tag = "fetchFileList") { fetchFileList() }
+        retryIO("tarball") {
+            val conn = openUrl(TARBALL_URL, readTimeoutMs = 600_000)   // 10-min cap
+            val total = conn.contentLengthLong.takeIf { it > 0 } ?: TARBALL_BYTES
+            var downloaded = 0L
 
-        // 2. Partition: large ONNX first, then everything else
-        val onnxFile   = fileList.firstOrNull { it.endsWith(MODEL_NAME) }
-            ?: throw Exception("Không tìm thấy file model $MODEL_NAME trên HuggingFace")
-        val otherFiles = fileList.filter { it != onnxFile && it !in SKIP_FILES }
+            try {
+                // Wrap HTTP stream in a progress-counting shim, then pipe through
+                // BZip2 decompressor and TAR reader — no temp file needed.
+                val counting = object : FilterInputStream(conn.inputStream) {
+                    override fun read(b: ByteArray, off: Int, len: Int): Int {
+                        val n = super.read(b, off, len)
+                        if (n > 0) { downloaded += n; onProgress(downloaded, total) }
+                        return n
+                    }
+                }
 
-        // Estimated total: ONNX ~62MB + rest ~3MB
-        val estimatedTotal = 65_000_000L
-        var downloaded = 0L
-
-        // 3. Download ONNX model (large file — retry individually)
-        val onnxDest = File(modelDir, MODEL_NAME)
-        retryIO(tag = MODEL_NAME) {
-            onnxDest.delete()   // remove partial file before each attempt
-            downloaded = downloadFile(
-                urlStr      = "$HF_RAW_URL/$onnxFile",
-                dest        = onnxDest,
-                prevBytes   = downloaded,
-                onBytes     = { bytes -> downloaded += bytes; onProgress(downloaded, estimatedTotal) },
-                readTimeoutMs = 300_000   // 5-min timeout for the large model file
-            )
-        }
-
-        // Verify ONNX is complete
-        val onnxSize = onnxDest.length()
-        if (onnxSize < MIN_ONNX_BYTES) {
-            throw Exception("File model bị không đầy đủ (${onnxSize / 1_000_000}MB < 50MB). Vui lòng thử lại.")
-        }
-
-        // 4. Download supporting files (tokens.txt + espeak-ng-data/*)
-        for (filePath in otherFiles) {
-            val dest = File(modelDir, filePath)
-            dest.parentFile?.mkdirs()
-            retryIO(tag = filePath) {
-                dest.delete()
-                downloaded = downloadFile(
-                    urlStr    = "$HF_RAW_URL/$filePath",
-                    dest      = dest,
-                    prevBytes = downloaded,
-                    onBytes   = { bytes -> downloaded += bytes; onProgress(downloaded, estimatedTotal) }
-                )
+                BZip2CompressorInputStream(counting).use { bzIn ->
+                    TarArchiveInputStream(bzIn).use { tarIn ->
+                        var entry = tarIn.nextTarEntry
+                        while (entry != null) {
+                            // Strip top-level directory (e.g. "vits-piper-.../tokens.txt" → "tokens.txt")
+                            val rel = entry.name.removePrefix(TAR_PREFIX)
+                            if (rel.isNotEmpty()) {
+                                val dest = File(modelDir, rel)
+                                if (entry.isDirectory) {
+                                    dest.mkdirs()
+                                } else {
+                                    dest.parentFile?.mkdirs()
+                                    dest.outputStream().use { out -> tarIn.copyTo(out) }
+                                }
+                            }
+                            entry = tarIn.nextTarEntry
+                        }
+                    }
+                }
+            } finally {
+                conn.disconnect()
             }
         }
 
-        // Signal 100% complete
-        onProgress(estimatedTotal, estimatedTotal)
+        // Verify the main model file is intact
+        val onnxSize = File(modelDir, MODEL_NAME).length()
+        if (onnxSize < MIN_ONNX_BYTES) {
+            throw Exception("Model bị lỗi khi giải nén (${onnxSize / 1_000_000} MB < 50 MB). Thử lại.")
+        }
+
+        onProgress(TARBALL_BYTES, TARBALL_BYTES)   // clamp to 100 %
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────────────
 
-    /**
-     * Retries [block] up to 3 times with exponential back-off (2 s, 4 s).
-     * Throws the last exception if all attempts fail.
-     */
+    /** Retries [block] up to 3 times with 2 s / 4 s back-off. */
     private fun <T> retryIO(tag: String, block: () -> T): T {
-        var lastError: Exception? = null
+        var lastErr: Exception? = null
         repeat(3) { attempt ->
             try {
                 return block()
             } catch (e: Exception) {
-                lastError = e
+                lastErr = e
                 if (attempt < 2) Thread.sleep(2000L * (attempt + 1))
             }
         }
-        throw lastError ?: Exception("Lỗi không xác định khi tải: $tag")
+        throw lastErr ?: Exception("Lỗi không xác định: $tag")
     }
 
     /**
-     * Fetches the model file list from the HuggingFace model API.
-     * Returns paths relative to the repo root (e.g. "espeak-ng-data/vi").
-     */
-    private fun fetchFileList(): List<String> {
-        val conn = openUrl(HF_API_URL)
-        val json = conn.inputStream.bufferedReader().readText()
-        conn.disconnect()
-        val obj = JSONObject(json)
-        val siblings = obj.getJSONArray("siblings")
-        return (0 until siblings.length()).map { i ->
-            siblings.getJSONObject(i).getString("rfilename")
-        }
-    }
-
-    /**
-     * Downloads [urlStr] to [dest].
-     * @param prevBytes bytes already counted before this call (used for retry accounting)
-     * @param readTimeoutMs per-read idle timeout; default 90 s
-     * @return [prevBytes] unchanged — progress accounting is via [onBytes] side-effect
-     */
-    private fun downloadFile(
-        urlStr: String,
-        dest: File,
-        prevBytes: Long,
-        onBytes: (Long) -> Unit,
-        readTimeoutMs: Int = 90_000
-    ): Long {
-        val conn = openUrl(urlStr, readTimeoutMs)
-        try {
-            conn.inputStream.use { input ->
-                dest.outputStream().use { output ->
-                    val buf = ByteArray(64 * 1024)
-                    var n: Int
-                    while (input.read(buf).also { n = it } != -1) {
-                        output.write(buf, 0, n)
-                        onBytes(n.toLong())
-                    }
-                }
-            }
-        } finally {
-            conn.disconnect()
-        }
-        return prevBytes   // unused; progress tracked via onBytes
-    }
-
-    /**
-     * Opens a URL following HTTP redirects across different hosts.
-     * Handles both absolute and relative Location headers.
+     * Opens a URL following HTTP redirects (absolute and relative Location headers).
+     * [readTimeoutMs] is the per-read idle timeout; set it large for big files.
      */
     private fun openUrl(urlStr: String, readTimeoutMs: Int = 90_000): HttpURLConnection {
         var current = urlStr
