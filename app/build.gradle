@@ -60,8 +60,9 @@ android {
 
     // Store the ONNX model uncompressed inside the APK so AssetManager can
     // stream it directly without in-memory decompression overhead.
-    androidResources {
-        noCompress += ["onnx"]
+    // aaptOptions.noCompress is the tested way that reliably works in AGP 8.x.
+    aaptOptions {
+        noCompress "onnx"
     }
 }
 

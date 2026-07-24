@@ -45,8 +45,10 @@ class MainActivity : AppCompatActivity() {
     private var isSeeking = false
 
     private val prefs by lazy { getSharedPreferences("tts_ui", Context.MODE_PRIVATE) }
+    // Default true — Piper is bundled in the APK, so it should be the default engine.
+    // Set to false only when the user explicitly switches to an Android TTS voice.
     private var usePiper: Boolean
-        get()      = prefs.getBoolean("use_piper", false)
+        get()      = prefs.getBoolean("use_piper", true)
         set(value) = prefs.edit().putBoolean("use_piper", value).apply()
 
     /** True while the Piper model is being downloaded in the background. */
@@ -76,26 +78,22 @@ class MainActivity : AppCompatActivity() {
             // is still null — this call ensures the language is actually set.
             applySpinnerLanguage(binding.spinnerLang.selectedItemPosition)
             updateVoiceLabel()
-            // Auto-enable Piper if user had previously selected it and model is ready
-            if (usePiper && !(ttsService?.isPiperEnabled() == true)) {
-                val svc = ttsService ?: return
-                if (svc.modelManager.isModelReady()) {
+            val svc = ttsService ?: return
+            when {
+                // Model not yet copied from assets — do it now (first launch or after delete)
+                !svc.modelManager.isModelReady() && !isPiperDownloading -> {
+                    startPiperDownload(svc)
+                }
+                // Model is ready but Piper is not running — enable it (handles crash-recovery)
+                svc.modelManager.isModelReady() && usePiper && !svc.isPiperEnabled() -> {
                     lifecycleScope.launch(Dispatchers.IO) {
                         val ok = svc.enablePiperTts()
                         withContext(Dispatchers.Main) {
                             if (ok) updateVoiceLabel()
-                            else { usePiper = false; toast("Lỗi khởi động Piper TTS") }
+                            else { usePiper = false; updateVoiceLabel() }
                         }
                     }
-                } else {
-                    usePiper = false  // model was deleted externally
                 }
-            }
-            // Auto-download Piper model whenever it's not ready and nothing is in progress.
-            // No "attempted" flag — we always retry so a failed/interrupted download resumes.
-            val svcForDownload = ttsService ?: return
-            if (!svcForDownload.modelManager.isModelReady() && !isPiperDownloading) {
-                startPiperDownload(svcForDownload)
             }
         }
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -392,7 +390,9 @@ class MainActivity : AppCompatActivity() {
                     updateVoiceLabel()
                     toast("Lỗi khởi động Piper — sẽ thử lại lần sau")
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
+                // Catch Throwable (not just Exception) to also catch OutOfMemoryError,
+                // preventing an uncaught error from crashing the app.
                 isPiperDownloading = false
                 withContext(Dispatchers.IO) { svc.modelManager.deleteModel() }
                 updateVoiceLabel()
